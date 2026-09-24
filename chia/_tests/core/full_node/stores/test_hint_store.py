@@ -1,30 +1,36 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 import pytest
+from chia_rs import ConsensusConstants
 from chia_rs.sized_bytes import bytes32
 from chia_rs.sized_ints import uint64
 
+from chia._tests.conftest import ConsensusMode
 from chia._tests.core.full_node.test_full_node import find_reward_coin
+from chia._tests.util.blockchain import open_hint_store
 from chia._tests.util.db_connection import DBConnection
 from chia.full_node.hint_store import HintStore
 from chia.server.server import ChiaServer
-from chia.simulator.block_tools import BlockTools
+from chia.simulator.block_tools import BlockTools, create_block_tools_async
 from chia.simulator.full_node_simulator import FullNodeSimulator
+from chia.simulator.setup_services import setup_full_node
 from chia.simulator.wallet_tools import WalletTool
 from chia.types.blockchain_format.coin import Coin
 from chia.types.condition_opcodes import ConditionOpcode
 from chia.types.condition_with_args import ConditionWithArgs
 from chia.util.casts import int_to_bytes
+from chia.util.keychain import Keychain
 
 log = logging.getLogger(__name__)
 
 
 @pytest.mark.anyio
-async def test_basic_store(db_version: int) -> None:
-    async with DBConnection(db_version) as db_wrapper:
-        hint_store = await HintStore.create(db_wrapper)
+@pytest.mark.parametrize("engine", ["sqlite", "rocksdb"])
+async def test_basic_store(db_version: int, engine: str, tmp_path: Path) -> None:
+    async with open_hint_store(tmp_path, db_version, engine=engine) as hint_store:
         hint_0 = 32 * b"\0"
         hint_1 = 32 * b"\1"
         not_existing_hint = 32 * b"\3"
@@ -48,9 +54,9 @@ async def test_basic_store(db_version: int) -> None:
 
 
 @pytest.mark.anyio
-async def test_duplicate_coins(db_version: int) -> None:
-    async with DBConnection(db_version) as db_wrapper:
-        hint_store = await HintStore.create(db_wrapper)
+@pytest.mark.parametrize("engine", ["sqlite", "rocksdb"])
+async def test_duplicate_coins(db_version: int, engine: str, tmp_path: Path) -> None:
+    async with open_hint_store(tmp_path, db_version, engine=engine) as hint_store:
         hint_0 = 32 * b"\0"
         hint_1 = 32 * b"\1"
 
@@ -66,9 +72,9 @@ async def test_duplicate_coins(db_version: int) -> None:
 
 
 @pytest.mark.anyio
-async def test_duplicate_hints(db_version: int) -> None:
-    async with DBConnection(db_version) as db_wrapper:
-        hint_store = await HintStore.create(db_wrapper)
+@pytest.mark.parametrize("engine", ["sqlite", "rocksdb"])
+async def test_duplicate_hints(db_version: int, engine: str, tmp_path: Path) -> None:
+    async with open_hint_store(tmp_path, db_version, engine=engine) as hint_store:
         hint_0 = 32 * b"\0"
         hint_1 = 32 * b"\1"
 
@@ -86,31 +92,24 @@ async def test_duplicate_hints(db_version: int) -> None:
 
 
 @pytest.mark.anyio
-async def test_duplicates(db_version: int) -> None:
-    async with DBConnection(db_version) as db_wrapper:
-        hint_store = await HintStore.create(db_wrapper)
+@pytest.mark.parametrize("engine", ["sqlite", "rocksdb"])
+async def test_duplicates(db_version: int, engine: str, tmp_path: Path) -> None:
+    async with open_hint_store(tmp_path, db_version, engine=engine) as hint_store:
         hint_0 = 32 * b"\0"
         coin_id_0 = bytes32(32 * b"\4")
 
-        for i in range(2):
+        for _ in range(2):
             hints = [(coin_id_0, hint_0), (coin_id_0, hint_0)]
             await hint_store.add_hints(hints)
         coins_for_hint_0 = await hint_store.get_coin_ids(hint_0)
         assert coin_id_0 in coins_for_hint_0
-
-        async with db_wrapper.reader_no_transaction() as conn:
-            cursor = await conn.execute("SELECT COUNT(*) FROM hints")
-            rows = list(await cursor.fetchall())
-
-        # even though we inserted the pair multiple times, there's only one
-        # entry in the DB
-        assert rows[0][0] == 1
+        assert await hint_store.count_hints() == 1
 
 
 @pytest.mark.anyio
-async def test_coin_ids_multi(db_version: int) -> None:
-    async with DBConnection(db_version) as db_wrapper:
-        hint_store = await HintStore.create(db_wrapper)
+@pytest.mark.parametrize("engine", ["sqlite", "rocksdb"])
+async def test_coin_ids_multi(db_version: int, engine: str, tmp_path: Path) -> None:
+    async with open_hint_store(tmp_path, db_version, engine=engine) as hint_store:
         hints = [32 * i.to_bytes(1, byteorder="big", signed=False) for i in range(256)]
         coin_ids = [bytes32(32 * i.to_bytes(1, byteorder="big", signed=False)) for i in range(256)]
 
@@ -184,9 +183,62 @@ async def test_hints_in_blockchain(
 
 
 @pytest.mark.anyio
-async def test_counts(db_version: int) -> None:
-    async with DBConnection(db_version) as db_wrapper:
-        hint_store = await HintStore.create(db_wrapper)
+@pytest.mark.limit_consensus_modes(reason="one full-node hint pass on RocksDB")
+async def test_hints_from_a_full_node_on_rocksdb(
+    blockchain_constants: ConsensusConstants,
+    consensus_mode: ConsensusMode,
+    get_keychain: Keychain,
+    testrun_uid: str,
+) -> None:
+    del consensus_mode
+    async with create_block_tools_async(
+        constants=blockchain_constants, keychain=get_keychain, testrun_uid=testrun_uid
+    ) as bt:
+        async with setup_full_node(
+            bt.constants,
+            "db/blockchain_v2_unit.rocksdb",
+            bt.config["self_hostname"],
+            bt,
+            db_version=2,
+        ) as service:
+            node = service._node
+            assert node._database_engine == "rocksdb"
+            blocks = bt.get_consecutive_blocks(
+                5,
+                block_list_input=[],
+                guarantee_transaction_block=True,
+                farmer_reward_puzzle_hash=bt.pool_ph,
+            )
+            for block in blocks:
+                await node.add_block(block)
+            wt: WalletTool = bt.get_pool_wallet_tool()
+            puzzle_hash = bytes32(32 * b"\0")
+            hint = bytes32(32 * b"\5")
+            coin_spent = find_reward_coin(blocks[-1], bt.pool_ph)
+            condition_dict = {
+                ConditionOpcode.CREATE_COIN: [
+                    ConditionWithArgs(ConditionOpcode.CREATE_COIN, [puzzle_hash, int_to_bytes(1), hint])
+                ]
+            }
+            tx = wt.generate_signed_transaction(
+                uint64(10),
+                wt.get_new_puzzlehash(),
+                coin_spent,
+                condition_dic=condition_dict,
+            )
+            blocks = bt.get_consecutive_blocks(
+                10, block_list_input=blocks, guarantee_transaction_block=True, transaction_data=tx
+            )
+            for block in blocks[-10:]:
+                await node.add_block(block)
+            found = await node.hint_store.get_coin_ids(hint)
+            assert found[0] == Coin(coin_spent.name(), puzzle_hash, uint64(1)).name()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("engine", ["sqlite", "rocksdb"])
+async def test_counts(db_version: int, engine: str, tmp_path: Path) -> None:
+    async with open_hint_store(tmp_path, db_version, engine=engine) as hint_store:
         count = await hint_store.count_hints()
         assert count == 0
 
@@ -203,9 +255,9 @@ async def test_counts(db_version: int) -> None:
 
 
 @pytest.mark.anyio
-async def test_limits(db_version: int) -> None:
-    async with DBConnection(db_version) as db_wrapper:
-        hint_store = await HintStore.create(db_wrapper)
+@pytest.mark.parametrize("engine", ["sqlite", "rocksdb"])
+async def test_limits(db_version: int, engine: str, tmp_path: Path) -> None:
+    async with open_hint_store(tmp_path, db_version, engine=engine) as hint_store:
 
         # Add 200 coins, all with the same hint
         hint = 32 * b"\0"
@@ -223,12 +275,14 @@ async def test_limits(db_version: int) -> None:
 
 
 @pytest.mark.anyio
-async def test_multi_batch_limit(db_version: int, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("engine", ["sqlite", "rocksdb"])
+async def test_multi_batch_limit(
+    db_version: int, engine: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """get_coin_ids_multi must enforce max_items globally across batches."""
     monkeypatch.setattr("chia.full_node.hint_store.SQLITE_MAX_VARIABLE_NUMBER", 5)
 
-    async with DBConnection(db_version) as db_wrapper:
-        hint_store = await HintStore.create(db_wrapper)
+    async with open_hint_store(tmp_path, db_version, engine=engine) as hint_store:
 
         num_hints = 20
         coins_per_hint = 3
@@ -260,12 +314,14 @@ async def test_multi_batch_limit(db_version: int, monkeypatch: pytest.MonkeyPatc
 
 
 @pytest.mark.anyio
-async def test_get_coin_ids_by_hints(db_version: int, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("engine", ["sqlite", "rocksdb"])
+async def test_get_coin_ids_by_hints(
+    db_version: int, engine: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     # small batch size, so the query below spans multiple batches
     monkeypatch.setattr("chia.full_node.hint_store.SQLITE_MAX_VARIABLE_NUMBER", 5)
 
-    async with DBConnection(db_version) as db_wrapper:
-        hint_store = await HintStore.create(db_wrapper)
+    async with open_hint_store(tmp_path, db_version, engine=engine) as hint_store:
 
         # empty input returns an empty set without opening a transaction
         assert await hint_store.get_coin_ids_by_hints(set()) == set()
