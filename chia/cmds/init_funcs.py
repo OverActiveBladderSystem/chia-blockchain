@@ -359,13 +359,18 @@ def chia_init(
         db_path_replaced = config["database_path"].replace("CHALLENGE", config["selected_network"])
         db_path = path_from_root(root_path, db_path_replaced)
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            # create new v2 db file
-            with sqlite3.connect(db_path) as connection:
-                set_db_version(connection, 2)
-        except sqlite3.OperationalError:
-            # db already exists, so we're good
-            pass
+        if db_path.name.endswith(".rocksdb"):
+            # The full node creates the empty RocksDB the first time it starts.
+            # Do not also create a SQLite file for a network that has none.
+            db_path.mkdir(parents=True, exist_ok=True)
+        else:
+            try:
+                # create new v2 db file
+                with sqlite3.connect(db_path) as connection:
+                    set_db_version(connection, 2)
+            except sqlite3.OperationalError:
+                # db already exists, so we're good
+                pass
 
     print("")
     print("To see your keys, run 'chia keys show --show-mnemonic-seed'")

@@ -26,6 +26,30 @@ def db_validate_func(
         db_path_replaced: str = db_pattern.replace("CHALLENGE", selected_network)
         in_db_path = path_from_root(root_path, db_path_replaced)
 
+    if in_db_path.is_dir() or in_db_path.name.endswith(".rocksdb"):
+        import asyncio
+
+        from chia.full_node.db.validate import validate_rocks
+
+        service_config = config["full_node"]
+        network_id = service_config["selected_network"]
+        overrides = service_config["network_overrides"]["constants"][network_id]
+        constants = replace_str_to_bytes(DEFAULT_CONSTANTS, **overrides)
+        peak, height, unspent = asyncio.run(
+            validate_rocks(
+                in_db_path,
+                genesis=constants.AGG_SIG_ME_ADDITIONAL_DATA,
+                validate_blocks=validate_blocks,
+            )
+        )
+        print(f"peak hash: {peak}")
+        print(f"peak height: {height}")
+        print(f"unspent coins: {unspent}")
+        if validate_blocks:
+            print("parsed every stored full block and block record")
+        print(f"\n\nDATABASE IS VALID: {in_db_path}\n")
+        return
+
     validate_v2(in_db_path, config=config, validate_blocks=validate_blocks)
 
     print(f"\n\nDATABASE IS VALID: {in_db_path}\n")

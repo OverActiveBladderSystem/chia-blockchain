@@ -6,13 +6,40 @@ import click
 
 from chia.cmds.cmd_classes import ChiaCliContext
 from chia.cmds.db_backup_func import db_backup_func
+from chia.cmds.db_migrate_func import db_migrate_func
 from chia.cmds.db_upgrade_func import db_upgrade_func
 from chia.cmds.db_validate_func import db_validate_func
+from chia.full_node.db.migrate import MigrationPaused
 
 
 @click.group("db", help="Manage the blockchain database")
 def db_cmd() -> None:
     pass
+
+
+@db_cmd.command("migrate", help="Copy the full node SQLite chain database to RocksDB while leaving SQLite in place")
+@click.option(
+    "--output",
+    "output_parent",
+    required=True,
+    type=click.Path(file_okay=False, path_type=Path),
+    help="Folder for the new blockchain_v2_<network>.rocksdb directory",
+)
+@click.option("--yes", is_flag=True, default=False, help="Continue even if the SQLite disk has under 10 GB free")
+@click.option("--no-update-config", is_flag=True, default=False, help="Do not offer to edit config.yaml when finished")
+@click.option("--abort", is_flag=True, default=False, help="Delete an unfinished RocksDB copy and keep the SQLite file")
+@click.pass_context
+def db_migrate_cmd(ctx: click.Context, output_parent: Path, yes: bool, no_update_config: bool, abort: bool) -> None:
+    try:
+        db_migrate_func(
+            ChiaCliContext.set_default(ctx).root_path,
+            output_parent,
+            yes=yes,
+            no_update_config=no_update_config,
+            abort=abort,
+        )
+    except (RuntimeError, MigrationPaused) as exc:
+        print(f"FAILED: {exc}")
 
 
 @db_cmd.command("upgrade", help="upgrade a v1 database to v2")

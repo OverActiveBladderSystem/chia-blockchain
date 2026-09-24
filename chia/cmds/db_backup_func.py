@@ -28,6 +28,15 @@ def db_backup_func(
 
 
 def backup_db(source_db: Path, backup_db: Path, *, no_indexes: bool) -> None:
+    if source_db.is_dir() or source_db.name.endswith(".rocksdb"):
+        if no_indexes:
+            raise RuntimeError("--no_indexes applies to a SQLite backup. A RocksDB backup is a full checkpoint.")
+        import asyncio
+
+        from chia.full_node.db.validate import backup_rocks
+
+        asyncio.run(backup_rocks(source_db, backup_db))
+        return
     import sqlite3
     from contextlib import closing
 
