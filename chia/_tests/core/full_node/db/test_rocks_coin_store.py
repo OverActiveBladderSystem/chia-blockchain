@@ -6,6 +6,7 @@ from chia_rs.sized_ints import uint32, uint64
 
 from chia.full_node.db.chain_db import ChainDB
 from chia.full_node.db.coin_store import RocksCoinStore
+from chia.full_node.db.keys import CF_COINS, CF_COINS_BY_PARENT, CF_COINS_BY_PUZZLE_CONFIRMED
 from chia.full_node.db.memory import MemoryBackend
 from chia.types.blockchain_format.coin import Coin
 
@@ -98,3 +99,92 @@ async def test_puzzle_hash_query_filters_spent_coins() -> None:
     assert {record.name for record in added} == {first.name(), second.name()}
     removed = await store.get_coins_removed_at_height(uint32(6))
     assert [record.name for record in removed] == [first.name()]
+
+
+@pytest.mark.anyio
+async def test_block_save_defers_lookup_keys_until_index_pending() -> None:
+    store = RocksCoinStore(ChainDB(MemoryBackend()))
+    created = _coin(PARENT, PUZZLE, 100)
+    reward = _coin(PARENT, OTHER, 1_750_000_000_000)
+    await store.new_block(uint32(1), uint64(10), [reward], [(created.name(), created, False)], [])
+
+    async with store.db.reader_no_transaction() as view:
+        puzzle_keys = await view.scan(CF_COINS_BY_PUZZLE_CONFIRMED, b"", None)
+        parent_keys = await view.scan(CF_COINS_BY_PARENT, b"", None)
+    assert puzzle_keys == []
+    assert parent_keys == []
+
+    by_puzzle = await store.get_coin_records_by_puzzle_hash(True, PUZZLE)
+    assert {record.name for record in by_puzzle} == {created.name()}
+    by_parent = await store.get_coin_records_by_parent_ids(True, [PARENT])
+    assert {record.name for record in by_parent} == {created.name(), reward.name()}
+
+    await store.index_pending()
+    async with store.db.reader_no_transaction() as view:
+        puzzle_keys = await view.scan(CF_COINS_BY_PUZZLE_CONFIRMED, b"", None)
+    assert len(puzzle_keys) == 2
+    by_puzzle_after = await store.get_coin_records_by_puzzle_hash(False, PUZZLE)
+    assert {record.name for record in by_puzzle_after} == {created.name()}
+
+    await store.new_block(uint32(2), uint64(20), [], [], [created.name()])
+    hidden = await store.get_coin_records_by_puzzle_hash(False, PUZZLE)
+    assert {record.name for record in hidden} == set()
+    spent_states = await store.get_coin_states_by_puzzle_hashes(True, {PUZZLE}, uint32(2))
+    assert {state.coin.name() for state in spent_states} == {created.name()}
+    await store.index_pending()
+    spent_again = await store.get_coin_states_by_puzzle_hashes(True, {PUZZLE}, uint32(2))
+    assert {state.coin.name() for state in spent_again} == {created.name()}
+
+
+class _CountingBackend(MemoryBackend):
+    def __init__(self) -> None:
+        super().__init__()
+        self.coin_lookups: list[list[bytes]] = []
+
+    async def get_many(self, cf: str, keys: list[bytes]) -> dict[bytes, bytes]:
+        if cf == CF_COINS:
+            self.coin_lookups.append(list(keys))
+        return await super().get_many(cf, keys)
+
+
+@pytest.mark.anyio
+async def test_block_save_does_not_probe_new_coin_ids() -> None:
+    backend = _CountingBackend()
+    store = RocksCoinStore(ChainDB(backend))
+    created = _coin(PARENT, PUZZLE, 100)
+    await store.new_block(
+        uint32(1),
+        uint64(10),
+        [],
+        [(created.name(), created, False)],
+        [],
+        assume_additions_are_new=True,
+    )
+    assert backend.coin_lookups == []
+    assert (await store.get_coin_record(created.name())) is not None
+
+    await store.new_block(uint32(2), uint64(20), [], [], [created.name()], assume_additions_are_new=True)
+    assert backend.coin_lookups == [[bytes(created.name())]]
+    spent = await store.get_coin_record(created.name())
+    assert spent is not None
+    assert spent.spent_block_index == 2
+
+    repeated = _coin(PARENT, OTHER, 5)
+    with pytest.raises(ValueError, match="already exists"):
+        await store.new_block(
+            uint32(3),
+            uint64(30),
+            [],
+            [(repeated.name(), repeated, False), (repeated.name(), repeated, False)],
+            [],
+            assume_additions_are_new=True,
+        )
+
+
+@pytest.mark.anyio
+async def test_new_block_still_rejects_a_coin_already_in_the_store() -> None:
+    store = RocksCoinStore(ChainDB(MemoryBackend()))
+    created = _coin(PARENT, PUZZLE, 100)
+    await store.new_block(uint32(1), uint64(10), [], [(created.name(), created, False)], [])
+    with pytest.raises(ValueError, match="already exists"):
+        await store.new_block(uint32(2), uint64(20), [], [(created.name(), created, False)], [])

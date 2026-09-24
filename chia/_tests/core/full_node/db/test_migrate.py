@@ -262,6 +262,16 @@ async def test_migrate_matches_sqlite_peak_and_coins(tmp_path: Path) -> None:
     reason = await unfinished_migration_reason(partial)
     assert reason is not None
     assert str(sqlite_path) in reason
+    from chia.full_node.full_node import FullNode
+
+    blocked = await FullNode.create(
+        {"database_path": str(partial), "selected_network": "mainnet"},
+        tmp_path,
+        DEFAULT_CONSTANTS,
+    )
+    with pytest.raises(RuntimeError, match="unfinished RocksDB migration"):
+        async with blocked._open_chain_db(None, "OFF", 2):
+            pass
 
     rocks_path = await migrate_database(
         sqlite_path,

@@ -18,6 +18,20 @@ def chain_db() -> ChainDB:
 
 
 @pytest.mark.anyio
+async def test_old_diagnostic_logs_are_capped(tmp_path: Path) -> None:
+    from chia.full_node.db.rocks import RocksBackend
+
+    path = tmp_path / "chain.rocksdb"
+    chain = ChainDB(RocksBackend(path, sync="OFF"))
+    await chain.close()
+    for index in range(10):
+        (path / f"LOG.old.{index}").write_bytes(b"x" * 64)
+    chain = ChainDB(RocksBackend(path, sync="OFF"))
+    await chain.close()
+    assert len(list(path.glob("LOG.old.*"))) <= 7
+
+
+@pytest.mark.anyio
 async def test_commit_is_visible_to_a_later_reader(chain_db: ChainDB) -> None:
     async with chain_db.writer() as session:
         session.put("meta", b"a", b"1")
