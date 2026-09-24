@@ -58,6 +58,14 @@ from chia.consensus.signage_point import SignagePoint
 from chia.full_node.block_store import BlockStore
 from chia.full_node.check_fork_next_block import check_fork_next_block
 from chia.full_node.coin_store import CoinStore
+from chia.full_node.db.block_store import RocksBlockStore
+from chia.full_node.db.chain_db import ChainDB
+from chia.full_node.db.coin_store import RocksCoinStore
+from chia.full_node.db.hint_store import RocksHintStore
+from chia.full_node.db.keys import ROCKS_SUFFIX, SQLITE_SUFFIX
+from chia.full_node.db.path import DatabaseChoice, choose_full_node_database, substitute_network
+from chia.full_node.db.rocks import RocksBackend
+from chia.full_node.db.startup import persist_full_node_database_path, unfinished_migration_reason
 from chia.full_node.full_node_api import FullNodeAPI
 from chia.full_node.full_node_store import FullNodeStore, FullNodeStorePeakResult, UnfinishedBlockEntry
 from chia.full_node.hint_management import get_hints_and_subscription_coin_ids
@@ -203,10 +211,13 @@ class FullNode:
     _new_peak_sem: LimitedSemaphore | None = None
     _sp_catchup_sem: LimitedSemaphore | None = None
     _add_transaction_semaphore: asyncio.Semaphore | None = None
+    _database_engine: str = "sqlite"
+    _suggest_migrate: bool = False
     _db_wrapper: DBWrapper2 | None = None
-    _hint_store: HintStore | None = None
-    _block_store: BlockStore | None = None
-    _coin_store: CoinStore | None = None
+    _chain_db: ChainDB | None = None
+    _hint_store: HintStore | RocksHintStore | None = None
+    _block_store: BlockStore | RocksBlockStore | None = None
+    _coin_store: CoinStore | RocksCoinStore | None = None
     _mempool_manager: MempoolManager | None = None
     _init_weight_proof: asyncio.Task[None] | None = None
     _blockchain: Blockchain | None = None
@@ -236,20 +247,88 @@ class FullNode:
         name: str = __name__,
     ) -> FullNode:
         # NOTE: async to force the queue creation to occur when an event loop is available
-        db_path_replaced: str = config["database_path"].replace("CHALLENGE", config["selected_network"])
-        db_path = path_from_root(root_path, db_path_replaced)
-        db_path.parent.mkdir(parents=True, exist_ok=True)
+        database_pattern = config.get("database_path")
+        selected_network = config["selected_network"]
+        pattern = str(database_pattern or "")
+        # The test harness uses names such as blockchain_test_0_sim.db. Those stay
+        # SQLite. A testing path that already ends in .rocksdb still opens RocksDB.
+        if config.get("testing") and not pattern.endswith(ROCKS_SUFFIX):
+            if pattern == "":
+                pattern = f"db/blockchain_v2_CHALLENGE{SQLITE_SUFFIX}"
+            choice = DatabaseChoice(
+                "sqlite",
+                path_from_root(root_path, substitute_network(pattern, selected_network)),
+            )
+        else:
+            choice = choose_full_node_database(root_path, database_pattern, selected_network)
+        if not config.get("testing") and choice.config_database_path is not None:
+            persist_full_node_database_path(root_path, choice.config_database_path)
+            config["database_path"] = choice.config_database_path
+        choice.path.parent.mkdir(parents=True, exist_ok=True)
 
-        return cls(
+        node = cls(
             root_path=root_path,
             config=config,
             constants=consensus_constants,
             signage_point_times=[time.time() for _ in range(consensus_constants.NUM_SPS_SUB_SLOT)],
             full_node_store=FullNodeStore(consensus_constants),
             log=logging.getLogger(name),
-            db_path=db_path,
+            db_path=choice.path,
             wallet_sync_queue=asyncio.Queue(),
         )
+        node._database_engine = choice.engine
+        node._suggest_migrate = choice.suggest_migrate
+        return node
+
+    @contextlib.asynccontextmanager
+    async def _open_chain_db(self, sql_log_path: Path | None, db_sync: str, db_version: int) -> AsyncIterator[None]:
+        if self._database_engine == "sqlite":
+            async with DBWrapper2.managed(
+                self.db_path,
+                db_version=db_version,
+                reader_count=self.config.get("db_readers", 4),
+                log_path=sql_log_path,
+                synchronous=db_sync,
+            ) as wrapper:
+                self._db_wrapper = wrapper
+                if self.db_wrapper.db_version != 2:
+                    async with self.db_wrapper.reader_no_transaction() as conn:
+                        async with conn.execute(
+                            "SELECT name FROM sqlite_master WHERE type='table' AND name='full_blocks'"
+                        ) as cur:
+                            if len(list(await cur.fetchall())) == 0:
+                                try:
+                                    async with self.db_wrapper.writer_maybe_transaction() as writer:
+                                        await set_db_version_async(writer, 2)
+                                        self.db_wrapper.db_version = 2
+                                        self.log.info("blockchain database is empty, configuring as v2")
+                                except sqlite3.OperationalError:
+                                    pass
+                self._block_store = await BlockStore.create(self.db_wrapper)
+                self._hint_store = await HintStore.create(self.db_wrapper)
+                self._coin_store = await CoinStore.create(self.db_wrapper)
+                try:
+                    yield
+                finally:
+                    self._block_store = None
+                    self._hint_store = None
+                    self._coin_store = None
+                    self._db_wrapper = None
+            return
+
+        chain = ChainDB(RocksBackend(self.db_path, sync=db_sync))
+        self._chain_db = chain
+        try:
+            self._block_store = await RocksBlockStore.create(chain)
+            self._hint_store = await RocksHintStore.create(chain)
+            self._coin_store = await RocksCoinStore.create(chain)
+            yield
+        finally:
+            self._block_store = None
+            self._hint_store = None
+            self._coin_store = None
+            self._chain_db = None
+            await chain.close()
 
     @contextlib.asynccontextmanager
     async def manage(self) -> AsyncIterator[None]:
@@ -275,43 +354,28 @@ class FullNode:
                 self.log.info(f"logging SQL commands to {sql_log_path}")
                 sql_log_file = exit_stack.enter_context(sql_log_path.open("a", encoding="utf-8"))
 
-            # create the store (db) and full node instance
-            # TODO: is this standardized and thus able to be handled by DBWrapper2?
-            async with manage_connection(self.db_path, log_file=sql_log_file, name="version_check") as db_connection:
-                db_version = await lookup_db_version(db_connection)
-
-        self.log.info(f"using blockchain database {self.db_path}, which is version {db_version}")
+            db_version = 2
+            if self._database_engine == "sqlite":
+                async with manage_connection(
+                    self.db_path, log_file=sql_log_file, name="version_check"
+                ) as db_connection:
+                    db_version = await lookup_db_version(db_connection)
+                self.log.info(f"using blockchain database {self.db_path}, which is version {db_version}")
+                if self._suggest_migrate:
+                    self.log.info(
+                        "This full node is still using SQLite. `chia db migrate --output <directory>` "
+                        "can copy it to RocksDB while this node keeps farming."
+                    )
+            else:
+                reason = await unfinished_migration_reason(self.db_path)
+                if reason is not None:
+                    raise RuntimeError(reason)
+                self.log.info(f"using blockchain database {self.db_path} (rocksdb)")
 
         db_sync = db_synchronous_on(self.config.get("db_sync", "auto"))
         self.log.info(f"opening blockchain DB: synchronous={db_sync}")
 
-        async with DBWrapper2.managed(
-            self.db_path,
-            db_version=db_version,
-            reader_count=self.config.get("db_readers", 4),
-            log_path=sql_log_path,
-            synchronous=db_sync,
-        ) as self._db_wrapper:
-            if self.db_wrapper.db_version != 2:
-                async with self.db_wrapper.reader_no_transaction() as conn:
-                    async with conn.execute(
-                        "SELECT name FROM sqlite_master WHERE type='table' AND name='full_blocks'"
-                    ) as cur:
-                        if len(list(await cur.fetchall())) == 0:
-                            try:
-                                # this is a new DB file. Make it v2
-                                async with self.db_wrapper.writer_maybe_transaction() as w_conn:
-                                    await set_db_version_async(w_conn, 2)
-                                    self.db_wrapper.db_version = 2
-                                    self.log.info("blockchain database is empty, configuring as v2")
-                            except sqlite3.OperationalError:
-                                # it could be a database created with "chia init", which is
-                                # empty except it has the database_version table
-                                pass
-
-            self._block_store = await BlockStore.create(self.db_wrapper)
-            self._hint_store = await HintStore.create(self.db_wrapper)
-            self._coin_store = await CoinStore.create(self.db_wrapper)
+        async with self._open_chain_db(sql_log_path, db_sync, db_version):
             self.log.info("Initializing blockchain from disk")
             start_time = time.monotonic()
             single_threaded = self.config.get("single_threaded", False)
@@ -333,7 +397,13 @@ class FullNode:
                 )
                 self.log.info(f"Started {num_workers} threads for validation ({dedicated} dedicated)")
             selected_network = self.config.get("selected_network")
-            height_map = await BlockHeightMap.create(self.db_path.parent, self._db_wrapper, selected_network)
+            if self._db_wrapper is not None:
+                height_map = await BlockHeightMap.create(self.db_path.parent, self._db_wrapper, selected_network)
+            else:
+                assert isinstance(self.block_store, RocksBlockStore)
+                height_map = await BlockHeightMap.create_for_rocks(
+                    self.db_path.parent, self.block_store, selected_network
+                )
             self._blockchain = await Blockchain.create(
                 coin_store=self.coin_store,
                 block_store=self.block_store,
@@ -466,7 +536,7 @@ class FullNode:
                     await asyncio.gather(*self._segment_task_list, return_exceptions=True)
 
     @property
-    def block_store(self) -> BlockStore:
+    def block_store(self) -> BlockStore | RocksBlockStore:
         assert self._block_store is not None
         return self._block_store
 
@@ -491,7 +561,7 @@ class FullNode:
         return self._pool
 
     @property
-    def coin_store(self) -> CoinStore:
+    def coin_store(self) -> CoinStore | RocksCoinStore:
         assert self._coin_store is not None
         return self._coin_store
 
@@ -511,7 +581,7 @@ class FullNode:
         return self._db_wrapper
 
     @property
-    def hint_store(self) -> HintStore:
+    def hint_store(self) -> HintStore | RocksHintStore:
         assert self._hint_store is not None
         return self._hint_store
 
@@ -2325,8 +2395,11 @@ class FullNode:
             validation_start = time.monotonic()
             # Tries to add the block to the blockchain, if we already validated transactions, don't do it again
             conds = None
+            reused_unfinished = False
             if pre_validation_result is not None and pre_validation_result.conds is not None:
                 conds = pre_validation_result.conds
+                reused_unfinished = True
+            phase_times: dict[str, float] = {}
 
             # Don't validate signatures because we want to validate them in the main thread later, since we have a
             # cache available
@@ -2349,6 +2422,7 @@ class FullNode:
                 self.pool,
                 conds,
                 ValidationState(ssi, diff, prev_ses_block),
+                phase_times=phase_times,
             )
             pre_validation_result = await future
             added: AddBlockResult | None = None
@@ -2371,7 +2445,11 @@ class FullNode:
                     if fork_info is None:
                         fork_info = ForkInfo(block.height - 1, block.height - 1, block.prev_header_hash)
                     (added, error_code, state_change_summary) = await self.blockchain.add_block(
-                        block, pre_validation_result, ssi, fork_info
+                        block,
+                        pre_validation_result,
+                        ssi,
+                        fork_info,
+                        phase_times=phase_times,
                     )
                 add_block_time = time.monotonic() - add_block_start
                 if added == AddBlockResult.ALREADY_HAVE_BLOCK:
@@ -2433,14 +2511,35 @@ class FullNode:
             if block.transactions_info is not None
             else ""
         )
+        conds_for_counts = pre_validation_result.conds
+        additions = 0
+        removals = 0
+        if conds_for_counts is not None:
+            removals = len(conds_for_counts.spends)
+            additions = sum(len(spend.create_coin) for spend in conds_for_counts.spends)
+        ref_count = len(block.transactions_generator_ref_list)
+        if validation_time > 2:
+            log_level = logging.WARNING
+        elif added == AddBlockResult.NEW_PEAK:
+            log_level = logging.INFO
+        else:
+            log_level = logging.DEBUG
         self.log.log(
-            logging.WARNING if validation_time > 2 else logging.DEBUG,
+            log_level,
             f"Block validation: {validation_time:0.2f}s, "
             f"pre_validation: {pre_validation_time:0.2f}s, "
-            f"CLVM: {pre_validation_result.timing / 1000.0:0.2f}s, "
+            f"generator-read: {phase_times.get('generator_read', 0.0):0.2f}s, "
+            f"clvm-run: {phase_times.get('clvm_run', 0.0):0.2f}s, "
+            f"header: {phase_times.get('header', 0.0):0.2f}s, "
+            f"coin-lookup: {phase_times.get('coin_lookup', 0.0):0.2f}s ({int(phase_times.get('coin_lookups', 0.0))}), "
+            f"body: {phase_times.get('body', 0.0):0.2f}s, "
+            f"db-write: {phase_times.get('db_write', 0.0):0.2f}s, "
+            f"height-map: {phase_times.get('height_map', 0.0):0.2f}s, "
             f"add-block: {add_block_time:0.2f}s, "
             f"post-process: {post_process_time:0.2f}s, "
             f"post-process2: {post_process_time2:0.2f}s, "
+            f"additions: {additions}, removals: {removals}, refs: {ref_count}, "
+            f"cached: {'yes' if reused_unfinished else 'no'}, "
             f"cost: {block.transactions_info.cost if block.transactions_info is not None else 'None'}"
             f"{percent_full_str} header_hash: {header_hash.hex()} height: {block.height}",
         )
