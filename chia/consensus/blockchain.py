@@ -626,6 +626,7 @@ class Blockchain:
                 included_reward_coins,
                 tx_additions,
                 tx_removals,
+                assume_additions_are_new=True,
             )
             if self._log_coins and (len(tx_removals) > 0 or len(tx_additions) > 0):
                 log.info(
