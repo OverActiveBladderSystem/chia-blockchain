@@ -15,18 +15,12 @@ from chia.full_node.db.rocks import RocksBackend
 from chia.util.config import lock_and_load_config, save_config
 
 
-async def unfinished_migration_reason(path: Path) -> str | None:
-    """Return an error string when `path` is a RocksDB copy that has not finished."""
-    if not (path / "CURRENT").exists():
-        return None
-    database = ChainDB(RocksBackend(path, sync="OFF"))
-    try:
-        async with database.reader_no_transaction() as view:
-            phase = await view.get(CF_META, META_MIGRATE_PHASE)
-            complete = await view.get(CF_META, META_COMPLETE)
-            source = await view.get(CF_META, META_MIGRATE_SOURCE)
-    finally:
-        await database.close()
+async def migration_block_reason(database: ChainDB, path: Path) -> str | None:
+    """Return an error string when an already-open RocksDB copy has not finished."""
+    async with database.reader_no_transaction() as view:
+        phase = await view.get(CF_META, META_MIGRATE_PHASE)
+        complete = await view.get(CF_META, META_COMPLETE)
+        source = await view.get(CF_META, META_MIGRATE_SOURCE)
     if complete == b"1" or phase in {None, b"complete"}:
         return None
     phase_name = phase.decode() if phase is not None else "unknown"
@@ -36,6 +30,17 @@ async def unfinished_migration_reason(path: Path) -> str | None:
         f"Set database_path back to {sqlite_path}, rerun `chia db migrate`, "
         "and restart only after it finishes."
     )
+
+
+async def unfinished_migration_reason(path: Path) -> str | None:
+    """Return an error string when `path` is a RocksDB copy that has not finished."""
+    if not (path / "CURRENT").exists():
+        return None
+    database = ChainDB(RocksBackend(path, sync="OFF"))
+    try:
+        return await migration_block_reason(database, path)
+    finally:
+        await database.close()
 
 
 def _sqlite_path_to_restore(rocks_path: Path, source: bytes | None) -> Path:

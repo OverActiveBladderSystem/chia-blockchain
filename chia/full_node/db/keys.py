@@ -9,6 +9,7 @@ CF_COINS_BY_SPENT = "coins_by_spent"
 CF_COINS_BY_PUZZLE_CONFIRMED = "coins_by_puzzle_confirmed"
 CF_COINS_BY_PUZZLE_SPENT = "coins_by_puzzle_spent"
 CF_COINS_BY_PARENT = "coins_by_parent"
+CF_COIN_DELTA = "coin_delta"
 CF_FF_UNSPENT = "ff_unspent"
 CF_BLOCK_BLOBS = "block_blobs"
 CF_BLOCK_META = "block_meta"
@@ -28,6 +29,7 @@ COLUMN_FAMILIES: tuple[str, ...] = (
     CF_COINS_BY_PUZZLE_CONFIRMED,
     CF_COINS_BY_PUZZLE_SPENT,
     CF_COINS_BY_PARENT,
+    CF_COIN_DELTA,
     CF_FF_UNSPENT,
     CF_BLOCK_BLOBS,
     CF_BLOCK_META,
@@ -46,6 +48,10 @@ META_FORMAT = b"db_format"
 META_FORMAT_VALUE = b"rocksdb-v1"
 META_SCHEMA_VERSION = b"schema_version"
 META_UNSPENT = b"unspent_count"
+# Last height whose wallet lookup keys are written. Missing means this database
+# has no coin journals yet (the historical layout). -1 means journals exist and
+# none of them are indexed.
+META_COIN_INDEXED = b"coin_indexed_height"
 META_COMPLETE = b"complete"
 META_PEAK = b"peak"
 META_COMPACT_COUNT = b"compact_count"

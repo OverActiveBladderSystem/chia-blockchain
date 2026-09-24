@@ -76,3 +76,63 @@ def index_entries(record: StoredCoin) -> list[tuple[str, bytes]]:
     if record.spent_index == -1:
         entries.append((CF_FF_UNSPENT, bytes(record.puzzle_hash) + name))
     return entries
+
+
+def lookup_entries(record: StoredCoin) -> list[tuple[str, bytes]]:
+    """Wallet lookup keys only. Height scans use the per-block journal instead."""
+    name = bytes(record.coin_name)
+    confirmed = u32_be(record.confirmed_index)
+    entries = [
+        (CF_COINS_BY_PUZZLE_CONFIRMED, bytes(record.puzzle_hash) + confirmed + name),
+        (CF_COINS_BY_PARENT, bytes(record.parent) + confirmed + name),
+    ]
+    if record.spent_index > 0:
+        spent = u32_be(record.spent_index)
+        entries.append((CF_COINS_BY_PUZZLE_SPENT, bytes(record.puzzle_hash) + spent + name))
+    if record.spent_index == -1:
+        entries.append((CF_FF_UNSPENT, bytes(record.puzzle_hash) + name))
+    return entries
+
+
+_DELTA_MAGIC = b"CD1"
+
+
+def encode_delta(added: list[StoredCoin], removed: list[tuple[bytes32, int]]) -> bytes:
+    parts = [_DELTA_MAGIC, len(added).to_bytes(4, "big", signed=False)]
+    for record in added:
+        parts.append(bytes(record.coin_name))
+        parts.append(encode_coin(record))
+    parts.append(len(removed).to_bytes(4, "big", signed=False))
+    for name, previous_spent in removed:
+        parts.append(bytes(name))
+        parts.append(int(previous_spent).to_bytes(8, "big", signed=True))
+    return b"".join(parts)
+
+
+def decode_delta(raw: bytes) -> tuple[list[StoredCoin], list[tuple[bytes32, int]]]:
+    if len(raw) < 7 or raw[:3] != _DELTA_MAGIC:
+        raise ValueError("coin journal is not a CD1 record")
+    added_count = int.from_bytes(raw[3:7], "big", signed=False)
+    cursor = 7
+    added: list[StoredCoin] = []
+    record_len = 32 + _RECORD_LEN
+    added_end = cursor + added_count * record_len
+    if added_end + 4 > len(raw):
+        raise ValueError("coin journal additions are truncated")
+    while cursor < added_end:
+        name = bytes32(raw[cursor : cursor + 32])
+        cursor += 32
+        added.append(decode_coin(name, raw[cursor : cursor + _RECORD_LEN]))
+        cursor += _RECORD_LEN
+    removed_count = int.from_bytes(raw[cursor : cursor + 4], "big", signed=False)
+    cursor += 4
+    removed_end = cursor + removed_count * 40
+    if removed_end != len(raw):
+        raise ValueError("coin journal removals are truncated")
+    removed: list[tuple[bytes32, int]] = []
+    while cursor < removed_end:
+        name = bytes32(raw[cursor : cursor + 32])
+        previous = int.from_bytes(raw[cursor + 32 : cursor + 40], "big", signed=True)
+        removed.append((name, previous))
+        cursor += 40
+    return added, removed

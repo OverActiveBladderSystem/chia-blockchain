@@ -118,9 +118,14 @@ class RocksBackend:
         def write() -> None:
             db = self._db
             assert db is not None
+            ordered, sorted_keys = _ordered_write_ops(ops)
             batch = _new_batch()
-            for op in ops:
-                handle = db.get_column_family_handle(op.cf)  # type: ignore[attr-defined]
+            handles: dict[str, object] = {}
+            for op in ordered:
+                handle = handles.get(op.cf)
+                if handle is None:
+                    handle = db.get_column_family_handle(op.cf)  # type: ignore[attr-defined]
+                    handles[op.cf] = handle
                 if isinstance(op, Put):
                     batch.put(op.key, op.value, handle)
                 elif isinstance(op, Delete):
@@ -138,7 +143,7 @@ class RocksBackend:
                                 break
                             batch.delete(key, handle)
                             iterator.next()
-            db.write(batch)  # type: ignore[attr-defined]
+            db.write(batch, self._write_options(ordered=sorted_keys))  # type: ignore[attr-defined]
 
         await self._call(write)
 
@@ -160,15 +165,7 @@ class RocksBackend:
                 handle = db.get_column_family_handle(cf)  # type: ignore[attr-defined]
                 for key, value in pairs:
                     batch.put(key, value, handle)
-            if not disable_wal:
-                db.write(batch)  # type: ignore[attr-defined]
-                return
-            from rocksdict import WriteOptions
-
-            options = WriteOptions()
-            options.disable_wal = True
-            options.memtable_insert_hint_per_batch = True
-            db.write(batch, options)  # type: ignore[attr-defined]
+            db.write(batch, self._write_options(ordered=True, disable_wal=disable_wal))  # type: ignore[attr-defined]
 
         await self._call(write)
 
@@ -211,6 +208,20 @@ class RocksBackend:
 
         await self._call(merge)
 
+    def _write_options(self, *, ordered: bool, disable_wal: bool = False) -> object:
+        from rocksdict import WriteOptions
+
+        options = WriteOptions()
+        if disable_wal or self._sync.upper() == "OFF":
+            options.disable_wal = True
+        elif self._sync.upper() == "FULL":
+            options.sync = True
+        else:
+            options.sync = False
+        if ordered:
+            options.memtable_insert_hint_per_batch = True
+        return options
+
     async def close(self) -> None:
         self._loop = asyncio.get_running_loop()
 
@@ -241,12 +252,24 @@ def _cf_options(name: str) -> object:
     return options
 
 
+# Same shape as the full node debug.log: log_maxfilesrotation and log_maxbytesrotation.
+# Seven archived LOG.old files, each rolled at 50 MB. The live LOG is separate.
+_KEEP_DIAGNOSTIC_LOGS = 7
+_MAX_DIAGNOSTIC_LOG_BYTES = 50 * 1024 * 1024
+
+
+def _cap_diagnostic_logs(options: object) -> None:
+    options.set_keep_log_file_num(_KEEP_DIAGNOSTIC_LOGS)  # type: ignore[attr-defined]
+    options.set_max_log_file_size(_MAX_DIAGNOSTIC_LOG_BYTES)  # type: ignore[attr-defined]
+
+
 def _db_options() -> object:
     from rocksdict import Options
 
     options = Options(raw_mode=True)
     options.create_if_missing(True)
     options.create_missing_column_families(True)
+    _cap_diagnostic_logs(options)
     # 256 MB times several buffers times every column family reserves tens of GB
     # before any block is stored. 16 MB is enough for the copy batches.
     options.set_write_buffer_size(16 * 1024 * 1024)
@@ -257,6 +280,22 @@ def _db_options() -> object:
     cpus = os.cpu_count() or 2
     options.set_max_background_jobs(max(cpus, 2))
     return options
+
+
+def _ordered_write_ops(ops: list[Op]) -> tuple[list[Op], bool]:
+    """Sort puts by column family and key so RocksDB can insert them in order.
+
+    A range delete stays in the original order. For a single key, the last put or delete wins.
+    """
+    if any(isinstance(op, DeleteRange) for op in ops):
+        return ops, False
+    final: dict[tuple[str, bytes], Put | Delete] = {}
+    for op in ops:
+        if isinstance(op, Put | Delete):
+            final[op.cf, op.key] = op
+    deletes = sorted((op for op in final.values() if isinstance(op, Delete)), key=lambda op: (op.cf, op.key))
+    puts = sorted((op for op in final.values() if isinstance(op, Put)), key=lambda op: (op.cf, op.key))
+    return [*deletes, *puts], True
 
 
 def _apply_bulk_options(options: object) -> None:
@@ -286,6 +325,7 @@ def _open_db(path: Path, sync: str, *, bulk: bool = False) -> object:
 
         loaded, existing = Options.load_latest(location)
         loaded.create_missing_column_families(True)
+        _cap_diagnostic_logs(loaded)
         if bulk:
             _apply_bulk_options(loaded)
             for family_options in existing.values():
