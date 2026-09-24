@@ -4,7 +4,9 @@ import asyncio
 import dataclasses
 import enum
 import logging
+import time
 import traceback
+from collections.abc import Collection
 from enum import Enum
 from typing import TYPE_CHECKING, ClassVar, cast
 
@@ -309,6 +311,7 @@ class Blockchain:
         fork_info: ForkInfo,
         prev_ses_block: BlockRecord | None = None,
         block_record: BlockRecord | None = None,
+        phase_times: dict[str, float] | None = None,
     ) -> tuple[AddBlockResult, Err | None, StateChangeSummary | None]:
         """
         This method must be called under the blockchain lock
@@ -399,16 +402,29 @@ class Blockchain:
         assert block.height == 0 or fork_info.peak_hash == block.prev_header_hash
 
         assert not block_has_transactions_generator(block) or pre_validation_result.validated_signature
+
+        async def timed_coin_lookup(names: Collection[bytes32]) -> list[CoinRecord]:
+            started = time.monotonic()
+            try:
+                return await self.coin_store.get_coin_records(names)
+            finally:
+                if phase_times is not None:
+                    phase_times["coin_lookup"] = phase_times.get("coin_lookup", 0.0) + (time.monotonic() - started)
+                    phase_times["coin_lookups"] = phase_times.get("coin_lookups", 0.0) + len(names)
+
+        body_started = time.monotonic()
         error_code = await validate_block_body(
             self.constants,
             self,
-            self.coin_store.get_coin_records,
+            timed_coin_lookup,
             block,
             block.height,
             pre_validation_result.conds,
             fork_info,
             log_coins=self._log_coins,
         )
+        if phase_times is not None:
+            phase_times["body"] = time.monotonic() - body_started
         if error_code is not None:
             return AddBlockResult.INVALID_BLOCK, error_code, None
 
@@ -437,6 +453,7 @@ class Blockchain:
         previous_peak_height = self._peak_height
         prev_fork_peak = (fork_info.peak_height, fork_info.peak_hash)
 
+        db_started = time.monotonic()
         try:
             # Always add the block to the database
             async with self.block_store.transaction():
@@ -450,6 +467,8 @@ class Blockchain:
 
             # there's a suspension point here, as we leave the async context
             # manager
+            if phase_times is not None:
+                phase_times["db_write"] = time.monotonic() - db_started
 
             # make sure to update _peak_height after the transaction is committed,
             # otherwise other tasks may go look for this block before it's available
@@ -491,7 +510,10 @@ class Blockchain:
             raise
 
         # This is done outside the try-except in case it fails, since we do not want to revert anything if it does
+        map_started = time.monotonic()
         await self.__height_map.maybe_flush()
+        if phase_times is not None:
+            phase_times["height_map"] = time.monotonic() - map_started
 
         if state_change_summary is not None:
             # new coin records added

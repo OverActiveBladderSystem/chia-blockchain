@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import aiofiles
 from chia_rs import SubEpochSummary
@@ -23,7 +25,8 @@ class SesCache(Streamable):
 
 
 class BlockHeightMap:
-    db: DBWrapper2
+    db: DBWrapper2 | None
+    _chain_window: Callable[[int, int], Awaitable[dict[bytes32, tuple[uint32, bytes32, bytes | None]]]] | None
 
     # the below dictionaries are loaded from the database, from the peak
     # and back in time on startup.
@@ -60,6 +63,7 @@ class BlockHeightMap:
             raise RuntimeError(f"BlockHeightMap does not support database schema v{db.db_version}")
         self = BlockHeightMap()
         self.db = db
+        self._chain_window = None
 
         self.__counter = 0
         self.__first_dirty = 0
@@ -68,6 +72,7 @@ class BlockHeightMap:
         suffix = "" if (selected_network is None or selected_network == "mainnet") else f"-{selected_network}"
         self.__height_to_hash_filename = blockchain_dir / f"height-to-hash{suffix}"
         self.__ses_filename = blockchain_dir / f"sub-epoch-summaries{suffix}"
+        self._on_height: Callable[[int], None] | None = None
 
         async with self.db.reader_no_transaction() as conn:
             async with conn.execute("SELECT hash FROM current_peak WHERE key = 0") as cursor:
@@ -134,6 +139,61 @@ class BlockHeightMap:
 
         return self
 
+    @classmethod
+    async def create_for_rocks(
+        cls,
+        blockchain_dir: Path,
+        store: Any,
+        selected_network: str | None = None,
+        on_height: Callable[[int], None] | None = None,
+    ) -> BlockHeightMap:
+        self = BlockHeightMap()
+        self.db = None
+        self._chain_window = store.main_chain_height_map_window
+        self.__counter = 0
+        self.__first_dirty = 0
+        self.__height_to_hash = bytearray()
+        self.__sub_epoch_summaries = {}
+        self._on_height = on_height
+        suffix = "" if (selected_network is None or selected_network == "mainnet") else f"-{selected_network}"
+        self.__height_to_hash_filename = blockchain_dir / f"height-to-hash{suffix}"
+        self.__ses_filename = blockchain_dir / f"sub-epoch-summaries{suffix}"
+
+        row = await store.peak_height_map_row()
+        if row is None:
+            log.info("blockchain database is missing a peak. Not loading height-to-hash or sub-epoch-summaries")
+            return self
+
+        try:
+            async with aiofiles.open(self.__height_to_hash_filename, "rb") as height_file:
+                self.__height_to_hash = bytearray(await height_file.read())
+        except Exception as exc:
+            log.info(f"Failed to load height-to-hash: {exc}")
+        try:
+            async with aiofiles.open(self.__ses_filename, "rb") as ses_file:
+                loaded = SesCache.from_bytes(await ses_file.read()).content
+                self.__sub_epoch_summaries = {key: value for key, value in loaded}
+        except Exception as exc:
+            log.info(f"Failed to load sub-epoch-summaries: {exc}")
+
+        peak: bytes32 = row[0]
+        prev_hash: bytes32 = row[1]
+        height = row[2]
+        new_size = (height + 1) * 32
+        size = len(self.__height_to_hash)
+        if size > new_size:
+            del self.__height_to_hash[new_size:]
+        else:
+            self.__height_to_hash += bytearray([0] * (new_size - size))
+        self.__first_dirty = height + 1
+        if self.get_hash(height) != peak:
+            self.__set_hash(height, peak)
+        if row[3] is not None:
+            self.__sub_epoch_summaries[height] = row[3]
+        await self._load_blocks_from(height, prev_hash)
+        await self.maybe_flush()
+        return self
+
     def ensure_capacity(self, height: int) -> None:
         needed = (height + 1) * 32
         current = len(self.__height_to_hash)
@@ -154,14 +214,16 @@ class BlockHeightMap:
     async def maybe_flush(self) -> None:
         if self.__counter < 1000:
             return
+        await self.flush()
 
+    async def flush(self) -> None:
+        await self.write_height_file()
+        await self.write_ses_file()
+
+    async def write_height_file(self) -> None:
         assert (len(self.__height_to_hash) % 32) == 0
         offset = self.__first_dirty * 32
-
-        ses_buf = bytes(SesCache([(k, v) for (k, v) in self.__sub_epoch_summaries.items()]))
-
         self.__counter = 0
-
         try:
             async with aiofiles.open(self.__height_to_hash_filename, "r+b") as f:
                 map_buf = self.__height_to_hash[offset:].copy()
@@ -172,8 +234,10 @@ class BlockHeightMap:
             async with aiofiles.open(self.__height_to_hash_filename, "wb") as f:
                 map_buf = self.__height_to_hash.copy()
                 await f.write(map_buf)
-
         self.__first_dirty = len(self.__height_to_hash) // 32
+
+    async def write_ses_file(self) -> None:
+        ses_buf = bytes(SesCache([(k, v) for (k, v) in self.__sub_epoch_summaries.items()]))
         await write_file_async(self.__ses_filename, ses_buf)
 
     # load height-to-hash map entries from the DB starting at height back in
@@ -193,18 +257,21 @@ class BlockHeightMap:
             window_end = max(0, height - window_size)
             window_size = 5000
 
-            query = (
-                "SELECT header_hash,prev_hash,height,sub_epoch_summary from full_blocks "
-                "INDEXED BY height WHERE in_main_chain=1 AND height>=? AND height <?"
-            )
-
-            async with self.db.reader_no_transaction() as conn:
-                async with conn.execute(query, (window_end, height)) as cursor:
-                    # maps block-hash -> (height, prev-hash, sub-epoch-summary)
-                    ordered: dict[bytes32, tuple[uint32, bytes32, bytes | None]] = {}
-
-                    for r in await cursor.fetchall():
-                        ordered[r[0]] = (r[2], r[1], r[3])
+            # maps block-hash -> (height, prev-hash, sub-epoch-summary)
+            ordered: dict[bytes32, tuple[uint32, bytes32, bytes | None]]
+            if self._chain_window is not None:
+                ordered = await self._chain_window(window_end, int(height))
+            else:
+                assert self.db is not None
+                query = (
+                    "SELECT header_hash,prev_hash,height,sub_epoch_summary from full_blocks "
+                    "INDEXED BY height WHERE in_main_chain=1 AND height>=? AND height <?"
+                )
+                async with self.db.reader_no_transaction() as conn:
+                    async with conn.execute(query, (window_end, height)) as cursor:
+                        ordered = {}
+                        for row in await cursor.fetchall():
+                            ordered[row[0]] = (row[2], row[1], row[3])
 
             while height > window_end:
                 if prev_hash not in ordered:
@@ -233,6 +300,8 @@ class BlockHeightMap:
                     del self.__sub_epoch_summaries[height]
                 self.__set_hash(height, prev_hash)
                 prev_hash = entry[1]
+                if self._on_height is not None and height % 2000 == 0:
+                    self._on_height(int(height))
             log.info(f"Done validating at height {height}")
 
     def __set_hash(self, height: int, block_hash: bytes32) -> None:

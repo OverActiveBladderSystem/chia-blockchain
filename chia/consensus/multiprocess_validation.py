@@ -102,6 +102,7 @@ def _pre_validate_block(
     expected_vs: ValidationState,
     *,
     skip_commitment_validation: bool = False,
+    phase_times: dict[str, float] | None = None,
 ) -> PreValidationResult:
     """
     Args:
@@ -125,6 +126,7 @@ def _pre_validate_block(
 
     try:
         removals_and_additions: tuple[Collection[bytes32], Collection[Coin]] | None = None
+        clvm_run = 0.0
         if conds is not None:
             assert conds.validated_signature is True
             assert block_has_transactions_generator(block)
@@ -156,7 +158,9 @@ def _pre_validate_block(
                 if not is_canonical_serialization(generator_bytes):
                     return error_result(Err.INVALID_TRANSACTIONS_GENERATOR_ENCODING)
 
+            clvm_started = time.monotonic()
             err, err_msg, conds = _run_block(block, prev_generators, prev_tx_height, constants)
+            clvm_run = time.monotonic() - clvm_started
 
             assert (err is None) != (conds is None)
             if err is not None:
@@ -169,6 +173,7 @@ def _pre_validate_block(
             removals_and_additions = ([], [])
 
         assert conds is None or conds.validated_signature is True
+        header_started = time.monotonic()
         required_iters, error = validate_finished_header_block(
             constants,
             blockchain,
@@ -178,6 +183,9 @@ def _pre_validate_block(
             skip_commitment_validation=skip_commitment_validation,
         )
         error_int = None if error is None else uint16(error.code.value)
+        if phase_times is not None:
+            phase_times["clvm_run"] = clvm_run
+            phase_times["header"] = time.monotonic() - header_started
 
         validation_time = time.monotonic() - validation_start
         return PreValidationResult(
@@ -205,6 +213,7 @@ async def pre_validate_block(
     skip_commitment_validation: bool = False,
     nice: _SupportsLessThan = (0,),
     dedicated: bool = True,
+    phase_times: dict[str, float] | None = None,
 ) -> Awaitable[PreValidationResult]:
     """
     This method must be called under the blockchain lock
@@ -326,7 +335,10 @@ async def pre_validate_block(
     previous_generators: list[bytes] | None = None
 
     try:
+        generator_started = time.monotonic()
         block_generator: BlockGenerator | None = await get_block_generator(blockchain.lookup_block_generators, block)
+        if phase_times is not None:
+            phase_times["generator_read"] = time.monotonic() - generator_started
         if block_generator is not None:
             previous_generators = block_generator.generator_refs
     except ValueError:
@@ -345,6 +357,7 @@ async def pre_validate_block(
         prev_tx_height,
         expected_vs,
         skip_commitment_validation=skip_commitment_validation,
+        phase_times=phase_times,
         nice=nice,
         dedicated=dedicated,
     )
