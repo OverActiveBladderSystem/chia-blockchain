@@ -109,12 +109,17 @@ class CoinStore:
         included_reward_coins: Collection[Coin],
         tx_additions: Collection[tuple[bytes32, Coin, bool]],
         tx_removals: list[bytes32],
+        *,
+        assume_additions_are_new: bool = False,
     ) -> None:
         """
         Only called for blocks which are blocks (and thus have rewards and transactions)
         """
 
         start = time.monotonic()
+        # SQLite INSERT rejects a coin id that is already stored. The flag only
+        # changes the RocksDB block path, which would otherwise probe once per addition.
+        del assume_additions_are_new
 
         db_values_to_insert = []
 
