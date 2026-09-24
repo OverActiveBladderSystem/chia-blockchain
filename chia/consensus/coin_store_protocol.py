@@ -27,9 +27,15 @@ class CoinStoreProtocol(Protocol):
         included_reward_coins: Collection[Coin],
         tx_additions: Collection[tuple[bytes32, Coin, bool]],
         tx_removals: list[bytes32],
+        *,
+        assume_additions_are_new: bool = False,
     ) -> None:
         """
-        Add a new block to the coin store
+        Add a new block to the coin store.
+
+        `assume_additions_are_new` is set by block acceptance. Validation has already
+        rejected a repeated spend and a repeated output in the block, so the new coin
+        ids are not looked up in the historical coin table on the way in.
         """
 
     async def get_coin_records(self, coin_ids: Collection[bytes32]) -> list[CoinRecord]:
