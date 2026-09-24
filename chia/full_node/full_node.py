@@ -65,7 +65,7 @@ from chia.full_node.db.hint_store import RocksHintStore
 from chia.full_node.db.keys import ROCKS_SUFFIX, SQLITE_SUFFIX
 from chia.full_node.db.path import DatabaseChoice, choose_full_node_database, substitute_network
 from chia.full_node.db.rocks import RocksBackend
-from chia.full_node.db.startup import persist_full_node_database_path, unfinished_migration_reason
+from chia.full_node.db.startup import migration_block_reason, persist_full_node_database_path
 from chia.full_node.full_node_api import FullNodeAPI
 from chia.full_node.full_node_store import FullNodeStore, FullNodeStorePeakResult, UnfinishedBlockEntry
 from chia.full_node.hint_management import get_hints_and_subscription_coin_ids
@@ -319,9 +319,15 @@ class FullNode:
         chain = ChainDB(RocksBackend(self.db_path, sync=db_sync))
         self._chain_db = chain
         try:
+            reason = await migration_block_reason(chain, self.db_path)
+            if reason is not None:
+                raise RuntimeError(reason)
             self._block_store = await RocksBlockStore.create(chain)
             self._hint_store = await RocksHintStore.create(chain)
             self._coin_store = await RocksCoinStore.create(chain)
+            # Finish lookup keys for any block that was saved and then interrupted
+            # before its puzzle and parent indexes were written.
+            await self._coin_store.index_pending()
             yield
         finally:
             self._block_store = None
@@ -367,9 +373,6 @@ class FullNode:
                         "can copy it to RocksDB while this node keeps farming."
                     )
             else:
-                reason = await unfinished_migration_reason(self.db_path)
-                if reason is not None:
-                    raise RuntimeError(reason)
                 self.log.info(f"using blockchain database {self.db_path} (rocksdb)")
 
         db_sync = db_synchronous_on(self.config.get("db_sync", "auto"))
@@ -2218,6 +2221,10 @@ class FullNode:
         record = state_change_summary.peak
         for signage_point in ppp_result.signage_points:
             await self.signage_point_post_processing(*signage_point)
+        # The block is already the peak. Wallet lookup keys are a second write so the
+        # farmer hears about the signage point before those keys are stored.
+        if isinstance(self.coin_store, RocksCoinStore):
+            await self.coin_store.index_pending()
         for transaction_id in ppp_result.mempool_peak_added_tx_ids:
             self.log.debug(f"Added transaction to mempool: {transaction_id}")
             mempool_item = self.mempool_manager.get_mempool_item(transaction_id)
