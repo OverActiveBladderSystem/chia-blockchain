@@ -10,14 +10,25 @@ from chia.consensus.blockchain import AddBlockResult, Blockchain
 from chia.consensus.difficulty_adjustment import get_next_sub_slot_iters_and_difficulty
 from chia.consensus.multiprocess_validation import PreValidationResult, pre_validate_block
 from chia.full_node.block_store import BlockStore
+from chia.full_node.db.block_store import RocksBlockStore
 from chia.types.validation_state import ValidationState
 from chia.util.errors import Err
 
 
 async def check_block_store_invariant(bc: Blockchain) -> None:
-    # this checks sqlite-level invariants, so it needs the concrete store
-    assert isinstance(bc.block_store, BlockStore)
-    db_wrapper = bc.block_store.db_wrapper
+    """Every main-chain height from 0 through the peak is present exactly once."""
+    block_store = bc.block_store
+    if isinstance(block_store, RocksBlockStore):
+        peak = await block_store.get_peak()
+        if peak is None:
+            return
+        max_height = int(peak[1])
+        for height in range(max_height + 1):
+            assert await block_store.main_chain_hash_at(height) is not None
+        return
+
+    assert isinstance(block_store, BlockStore)
+    db_wrapper = block_store.db_wrapper
 
     if db_wrapper.db_version == 1:
         return
