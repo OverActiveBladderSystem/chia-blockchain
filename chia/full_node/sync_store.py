@@ -152,6 +152,9 @@ class SyncStore:
     def is_backtrack_syncing(self, node_id: bytes32) -> bool:
         return self._backtrack_syncing.get(node_id, 0) > 0
 
+    def any_backtrack_syncing(self) -> bool:
+        return len(self._backtrack_syncing) > 0
+
     def increment_backtrack_syncing(self, node_id: bytes32) -> None:
         self._backtrack_syncing[node_id] += 1
 

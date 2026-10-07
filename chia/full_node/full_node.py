@@ -10,7 +10,8 @@ import random
 import sqlite3
 import time
 import traceback
-from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Mapping, Sequence
+from concurrent.futures import Future
 from multiprocessing.context import BaseContext
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, TextIO, cast, final
@@ -52,7 +53,13 @@ from chia.consensus.condition_tools import pkm_pairs
 from chia.consensus.difficulty_adjustment import get_next_sub_slot_iters_and_difficulty
 from chia.consensus.get_block_challenge import post_hard_fork2, pre_sp_tx_block_height
 from chia.consensus.make_sub_epoch_summary import next_sub_epoch_summary
-from chia.consensus.multiprocess_validation import PreValidationResult, pre_validate_block
+from chia.consensus.multiprocess_validation import (
+    PreValidationResult,
+    earlier_programs_for_block,
+    pre_validate_block,
+    precompute_block_proofs,
+    precompute_transaction_program,
+)
 from chia.consensus.pot_iterations import calculate_sp_iters
 from chia.consensus.signage_point import SignagePoint
 from chia.full_node.block_store import BlockStore
@@ -61,6 +68,7 @@ from chia.full_node.coin_store import CoinStore
 from chia.full_node.db.block_store import RocksBlockStore
 from chia.full_node.db.chain_db import ChainDB
 from chia.full_node.db.coin_store import RocksCoinStore
+from chia.full_node.db.file_chip import SLOW_SAVE_SECONDS
 from chia.full_node.db.hint_store import RocksHintStore
 from chia.full_node.db.keys import ROCKS_SUFFIX, SQLITE_SUFFIX
 from chia.full_node.db.path import DatabaseChoice, choose_full_node_database, substitute_network
@@ -78,11 +86,17 @@ from chia.full_node.tx_processing_queue import PeerWithTx, TransactionQueue, Tra
 from chia.full_node.weight_proof import WeightProofHandler, _minimum_recent_chain_length
 from chia.protocols import farmer_protocol, full_node_protocol, timelord_protocol, wallet_protocol
 from chia.protocols.farmer_protocol import SignagePointSourceData, SPSubSlotSourceData, SPVDFSourceData
-from chia.protocols.full_node_protocol import RequestBlocks, RespondBlock, RespondBlocks, RespondSignagePoint
+from chia.protocols.full_node_protocol import (
+    RejectBlocks,
+    RequestBlocks,
+    RespondBlock,
+    RespondBlocks,
+    RespondSignagePoint,
+)
 from chia.protocols.outbound_message import Message, NodeType, make_msg
 from chia.protocols.protocol_message_types import ProtocolMessageTypes
 from chia.protocols.protocol_timing import CONSENSUS_ERROR_BAN_SECONDS
-from chia.protocols.shared_protocol import Capability
+from chia.protocols.shared_protocol import Capability, Error
 from chia.protocols.wallet_protocol import CoinStateUpdate, RemovedMempoolItem
 from chia.rpc.rpc_server import StateChangedProtocol
 from chia.server.node_discovery import FullNodePeers
@@ -118,6 +132,245 @@ from chia.util.task_referencer import create_referenced_task
 # Use 15s here instead of the default 60s call_api timeout to bound how
 # long short_sync_backtrack can occupy a new_peak slot.
 SHORT_SYNC_BACKTRACK_BLOCK_REQUEST_TIMEOUT_SEC: int = 15
+
+# Long sync was already cancelled. This is only the cap: a task that leaves
+# its database call returns immediately. Waiting with no limit held the chain
+# database open until the process was killed.
+LONG_SYNC_CANCEL_WAIT_SECONDS = 5
+
+# A peer that declines a block range, or answers with something other than the
+# blocks, waits this long before another try. Each further decline doubles it.
+_REFUSAL_BACKOFF_CAP_SECONDS = 60.0
+
+
+def _refusal_backoff_seconds(step: float, refusals: int) -> float:
+    shift = min(max(refusals, 1) - 1, 10)
+    return min(step * (2**shift), _REFUSAL_BACKOFF_CAP_SECONDS)
+
+
+def _block_reply_label(response: object) -> str:
+    if isinstance(response, RejectBlocks):
+        return f"refused {response.start_height}-{response.end_height}"
+    if isinstance(response, Error):
+        try:
+            code = Err(response.code).name
+        except ValueError:
+            code = str(int(response.code))
+        return f"error {code}: {response.message}"
+    return f"unexpected {type(response).__name__}"
+
+
+# Step names recorded while a long-sync batch is checked and saved.
+# clvm_run and header are worker time and overlap across blocks.
+# The other names run one block after another, so their sums are clock time.
+_BATCH_PHASE_NAMES = (
+    "generator_read",
+    "clvm_run",
+    "header",
+    "coin_lookup",
+    "body",
+    "db_write",
+    "height_map",
+)
+
+
+# Transaction programs kept from blocks already downloaded, so a later block
+# that names one of them can be run before its own turn. Oldest heights are
+# dropped. The real check repeats the run if the chain has different bytes.
+_AHEAD_GENERATOR_KEEP = 256
+
+
+def _remember_block_generators(generators: dict[int, bytes], blocks: list[FullBlock]) -> None:
+    """Store program bytes from blocks just downloaded.
+
+    Heights in this batch are kept even when that puts the map over the cap,
+    so the caller can queue programs that name them before a later batch
+    drops older heights.
+    """
+    fresh: set[int] = set()
+    for block in blocks:
+        program = get_transactions_generator_bytes(block)
+        if program is None:
+            continue
+        height = int(block.height)
+        generators[height] = program
+        fresh.add(height)
+    while len(generators) > _AHEAD_GENERATOR_KEEP:
+        oldest = min(generators)
+        if oldest in fresh:
+            break
+        del generators[oldest]
+
+
+def _saved_generator_heights(blocks: list[FullBlock], generators: Mapping[int, bytes], peak_height: int) -> set[int]:
+    """Heights named by these blocks that are already saved at or below the peak.
+
+    A height above the peak is still in the blocks being checked, or not
+    downloaded yet. Those bytes come from memory, not from this lookup.
+    """
+    missing: set[int] = set()
+    for block in blocks:
+        if block.foliage_transaction_block is None or not block_has_transactions_generator(block):
+            continue
+        for height in block.transactions_generator_ref_list:
+            named = int(height)
+            if named <= peak_height and named not in generators:
+                missing.add(named)
+    return missing
+
+
+class _BlockMath:
+    """One block's proof job, plus a program job only if the proof job already missed it."""
+
+    __slots__ = ("futures", "program_started")
+
+    def __init__(self) -> None:
+        self.futures: list[Future[Any]] = []
+        self.program_started = False
+
+
+def _run_block_program(
+    constants: ConsensusConstants,
+    block: FullBlock,
+    generators: Mapping[int, bytes],
+    entry: _BlockMath,
+) -> None:
+    """Run the transaction program when its older programs are already known."""
+    kind, programs = _ahead_block_work(block, generators)
+    if kind != "program" or programs is None:
+        return
+    precompute_transaction_program(constants, block, programs)
+    entry.program_started = True
+
+
+def _run_block_math(
+    constants: ConsensusConstants,
+    block: FullBlock,
+    generators: Mapping[int, bytes],
+    entry: _BlockMath,
+) -> None:
+    """Run this block's proof math, then its program if the bytes are in ``generators``."""
+    precompute_block_proofs(constants, block)
+    _run_block_program(constants, block, generators, entry)
+
+
+def _submit_block_math(
+    node: FullNode,
+    block: FullBlock,
+    generators: Mapping[int, bytes],
+    *,
+    program_only: bool,
+) -> bool:
+    """Queue this block's math once, at the same priority as its check, lowest height first.
+
+    The check waits for these jobs. A second call does not run the proof again.
+    A program that was missing when the proof job ran is queued once it is known.
+    Returns whether a new job was queued.
+    """
+    entry = node._block_math.get(block.header_hash)
+    if entry is None:
+        if program_only:
+            return False
+        entry = _BlockMath()
+        node._block_math[block.header_hash] = entry
+    elif program_only:
+        if entry.program_started or any(not future.done() for future in entry.futures):
+            return False
+        entry.program_started = True
+    else:
+        return False
+    pool = node.pool
+    fn = _run_block_program if program_only else _run_block_math
+    nice = (0, int(block.height))
+    if isinstance(pool, PriorityThreadPoolExecutor):
+        entry.futures.append(pool.submit(fn, node.constants, block, generators, entry, nice=nice, dedicated=False))
+        return True
+    pool.run_in_loop(fn, node.constants, block, generators, entry, nice=nice, dedicated=False)
+    return True
+
+
+def _ahead_block_work(block: FullBlock, generators: Mapping[int, bytes]) -> tuple[str, list[bytes] | None]:
+    """What background work this downloaded block can use.
+
+    ``non-transaction`` and ``reward-only`` have no program. ``needs-older``
+    names a program that is not in ``generators`` yet. ``program`` includes
+    the older program bytes, which is an empty list when the block names none.
+    """
+    if block.foliage_transaction_block is None or block.transactions_info is None:
+        return "non-transaction", None
+    if not block_has_transactions_generator(block):
+        return "reward-only", None
+    programs = earlier_programs_for_block(block, generators)
+    if programs is None:
+        return "needs-older", None
+    return "program", programs
+
+
+def _next_ahead_request(
+    next_yield: int,
+    target: int,
+    batch_size: int,
+    ahead_extra_ranges: int,
+    prefetch_limit: int,
+    in_flight_starts: Collection[int],
+    ready_starts: Collection[int],
+) -> tuple[int, int] | None:
+    """The next range to download past the one being checked.
+
+    At most ``ahead_extra_ranges`` later ranges are held, and at most
+    ``prefetch_limit`` of those requests are in flight. The range being
+    checked is not returned, and nothing past ``target`` is returned.
+    """
+    prefetching = sum(1 for start in in_flight_starts if start != next_yield)
+    if prefetching >= prefetch_limit:
+        return None
+    height = min(target, next_yield + batch_size - 1) + 1
+    held = 0
+    ready = set(ready_starts)
+    flying = set(in_flight_starts)
+    while height <= target and held < ahead_extra_ranges:
+        end = min(target, height + batch_size - 1)
+        if height in ready or height in flying:
+            held += 1
+            height = end + 1
+            continue
+        return height, end
+    return None
+
+
+def _batch_phase_totals(phases: list[dict[str, float]]) -> dict[str, float]:
+    totals = {name: 0.0 for name in _BATCH_PHASE_NAMES}
+    totals["coin_lookups"] = 0.0
+    totals["precomputed"] = 0.0
+    totals["math_ready"] = 0.0
+    totals["math_queued"] = 0.0
+    totals["math_wait"] = 0.0
+    for phase in phases:
+        for name in _BATCH_PHASE_NAMES:
+            totals[name] += float(phase.get(name, 0.0))
+        totals["coin_lookups"] += float(phase.get("coin_lookups", 0.0))
+        totals["precomputed"] += float(phase.get("precomputed", 0.0))
+        totals["math_ready"] += float(phase.get("math_ready", 0.0))
+        totals["math_queued"] += float(phase.get("math_queued", 0.0))
+        totals["math_wait"] += float(phase.get("math_wait", 0.0))
+    return totals
+
+
+async def _await_cancelled_long_sync(
+    log: logging.Logger,
+    task: asyncio.Task[None],
+    *,
+    timeout: float = LONG_SYNC_CANCEL_WAIT_SECONDS,
+) -> None:
+    if not task.done():
+        log.info(f"Awaiting long sync task {task.get_name()}")
+        await asyncio.wait({task}, timeout=timeout)
+    if not task.done():
+        log.warning(f"Long sync task {task.get_name()} did not stop; closing the database")
+        return
+    log.info(f"Long sync task {task.get_name()} done")
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
 
 
 async def respond_blocks_or_ban(
@@ -222,12 +475,19 @@ class FullNode:
     _init_weight_proof: asyncio.Task[None] | None = None
     _blockchain: Blockchain | None = None
     _pool: Executor | None = None
+    # Proof math for blocks already downloaded. The check waits for the same jobs.
+    _block_math: dict[bytes32, _BlockMath] = dataclasses.field(default_factory=dict)
     _timelord_lock: asyncio.Lock | None = None
     weight_proof_handler: WeightProofHandler | None = None
     # hashes of peaks that failed long sync on chip13 Validation
     bad_peak_cache: dict[bytes32, uint32] = dataclasses.field(default_factory=dict)
     wallet_sync_task: asyncio.Task[None] | None = None
     _bls_cache: BLSCache = dataclasses.field(default_factory=lambda: BLSCache(50000))
+    # The latest block save. A pack uses this so a heavy write or a queued save
+    # is left alone, including when the save happened inside a short sync.
+    _last_db_write_seconds: float = 0.0
+    _last_save_had_waiters: bool = False
+    _file_chip_save_noted: bool = False
 
     @property
     def server(self) -> ChiaServer:
@@ -326,8 +586,9 @@ class FullNode:
             self._hint_store = await RocksHintStore.create(chain)
             self._coin_store = await RocksCoinStore.create(chain)
             # Finish lookup keys for any block that was saved and then interrupted
-            # before its puzzle and parent indexes were written.
-            await self._coin_store.index_pending()
+            # before its puzzle and parent indexes were written. Each chunk commits
+            # on its own, so a large backlog logs its height instead of one silent write.
+            await self._coin_store.index_pending_all()
             yield
         finally:
             self._block_store = None
@@ -530,12 +791,7 @@ class FullNode:
                                 self.log.info(f"Awaiting TX task {one_tx_task.get_name()}")
                                 await one_tx_task
                     for one_sync_task in self._sync_task_list:
-                        if one_sync_task.done():
-                            self.log.info(f"Long sync task {one_sync_task.get_name()} done")
-                        else:
-                            with contextlib.suppress(asyncio.CancelledError):
-                                self.log.info(f"Awaiting long sync task {one_sync_task.get_name()}")
-                                await one_sync_task
+                        await _await_cancelled_long_sync(self.log, one_sync_task)
                     await asyncio.gather(*self._segment_task_list, return_exceptions=True)
 
     @property
@@ -747,6 +1003,10 @@ class FullNode:
         if peer.peer_node_id in self.sync_store.batch_syncing:
             return True  # Don't trigger a long sync
         self.sync_store.batch_syncing.add(peer.peer_node_id)
+        # Saves inside this batch are back to back. Note them only if this path
+        # records one, and decide on a pack after the whole batch lets go.
+        self._file_chip_save_noted = False
+        self._last_save_had_waiters = False
         try:
             self.log.info(f"Starting batch short sync from {start_height} to height {target_height}")
             if start_height > 0:
@@ -865,6 +1125,10 @@ class FullNode:
         """
         try:
             self.sync_store.increment_backtrack_syncing(node_id=peer.peer_node_id)
+            # Each block in the walk saves while this is still in progress.
+            # The pack waits until the walk has let go of the chain.
+            self._file_chip_save_noted = False
+            self._last_save_had_waiters = False
 
             unfinished_block: UnfinishedBlock | None = self.full_node_store.get_unfinished_block(target_unf_hash)
             curr_height: int = target_height
@@ -982,12 +1246,14 @@ class FullNode:
                 if await self.short_sync_backtrack(
                     peer, curr_peak_height, request.height, request.unfinished_reward_block_hash
                 ):
+                    await self._offer_file_chip_when_idle()
                     return None
 
             if request.height < self.constants.WEIGHT_PROOF_RECENT_BLOCKS:
                 # This is the case of syncing up more than a few blocks, at the start of the chain
                 self.log.debug("Doing batch sync, no backup")
-                await self.short_sync_batch(peer, uint32(0), request.height)
+                if await self.short_sync_batch(peer, uint32(0), request.height):
+                    await self._offer_file_chip_when_idle()
                 return None
 
             if (
@@ -996,6 +1262,7 @@ class FullNode:
             ):
                 # This case of being behind but not by so much
                 if await self.short_sync_batch(peer, uint32(max(curr_peak_height - 6, 0)), request.height):
+                    await self._offer_file_chip_when_idle()
                     return None
 
             # Clean up task reference list (used to prevent gc from killing running tasks)
@@ -1186,6 +1453,8 @@ class FullNode:
 
         self.sync_store.set_long_sync(True)
         self.log.debug("long sync started")
+        if self._chain_db is not None:
+            self._chain_db.pause_file_chip(True)
         try:
             self.log.info("Starting to perform sync.")
 
@@ -1364,6 +1633,117 @@ class FullNode:
                 self.log.warning(f"Banning peer {conn.peer_info.host} for advertising inflated weight")
                 await conn.close(CONSENSUS_ERROR_BAN_SECONDS)
 
+    def _queue_ahead_programs(
+        self,
+        blocks: list[FullBlock],
+        span: str,
+        generators: Mapping[int, bytes],
+        logged_spans: set[str],
+    ) -> None:
+        """Queue one math job per block that is not the next one yet.
+
+        The job uses the same priority as the check, ordered by height, on a
+        general thread. The check waits for it and reuses the result.
+        """
+        queued = 0
+        proofs = 0
+        non_tx = 0
+        reward_only = 0
+        needs_older = 0
+        for block in blocks:
+            kind, _programs = _ahead_block_work(block, generators)
+            if kind == "non-transaction":
+                non_tx += 1
+            elif kind == "reward-only":
+                reward_only += 1
+            elif kind == "needs-older":
+                needs_older += 1
+            entry = self._block_math.get(block.header_hash)
+            if entry is None:
+                if _submit_block_math(self, block, generators, program_only=False):
+                    proofs += 1
+                    if kind == "program":
+                        queued += 1
+            elif kind == "program" and _submit_block_math(self, block, generators, program_only=True):
+                queued += 1
+        if span not in logged_spans:
+            logged_spans.add(span)
+            self.log.info(
+                f"ahead {span}: {proofs} math jobs "
+                f"({queued} include the transaction program), "
+                f"{non_tx} non-transaction, {reward_only} reward-only, "
+                f"{needs_older} still waiting on an older program"
+            )
+        elif queued:
+            self.log.info(
+                f"ahead {span}: queued {queued} more transaction programs now that an older program is available"
+            )
+
+    def _queue_downloaded_programs(
+        self,
+        ready: dict[int, tuple[WSChiaConnection, list[FullBlock]]],
+        next_yield: int,
+        generators: Mapping[int, bytes],
+        logged_spans: set[str],
+    ) -> None:
+        """Queue work for ranges already downloaded past the one being checked."""
+        for start in sorted(ready):
+            if start == next_yield:
+                continue
+            blocks = ready[start][1]
+            if not blocks:
+                continue
+            end = int(blocks[-1].height)
+            self._queue_ahead_programs(blocks, f"{start}-{end}", generators, logged_spans)
+
+    async def _load_saved_programs(self, generators: Mapping[int, bytes], blocks: list[FullBlock]) -> dict[int, bytes]:
+        """Read older programs that are already stored at or below the peak."""
+        peak = self.blockchain.get_peak()
+        if peak is None:
+            return {}
+        missing = _saved_generator_heights(blocks, generators, int(peak.height))
+        if not missing:
+            return {}
+        try:
+            found = await self.blockchain.block_store.get_generators_at({uint32(height) for height in missing})
+        except (KeyError, ValueError):
+            return {}
+        return {int(height): program for height, program in found.items()}
+
+    def _send_ahead_range(
+        self,
+        send: Callable[[int, int, WSChiaConnection], None],
+        choose_peer: Callable[[], tuple[WSChiaConnection, float] | None],
+        in_flight: list[Any],
+        ready: dict[int, tuple[WSChiaConnection, list[FullBlock]]],
+        next_yield: int,
+        target: int,
+        batch_size: int,
+        ahead_extra_ranges: int,
+        prefetch_limit: int,
+    ) -> bool:
+        """Ask for one later range when the next range is already requested.
+
+        Each range is requested once. A backup request for the range being
+        checked is separate and is not blocked by these.
+        """
+        found = _next_ahead_request(
+            next_yield,
+            target,
+            batch_size,
+            ahead_extra_ranges,
+            prefetch_limit,
+            [flight.start_height for flight in in_flight],
+            ready,
+        )
+        if found is None:
+            return False
+        chosen = choose_peer()
+        if chosen is None or chosen[1] > time.monotonic():
+            return False
+        send(found[0], found[1], chosen[0])
+        return True
+
     async def sync_from_fork_point(
         self,
         fork_point_height: uint32,
@@ -1372,6 +1752,8 @@ class FullNode:
         summaries: list[SubEpochSummary],
     ) -> None:
         self.log.info(f"Start syncing from fork point at {fork_point_height} up to {target_peak_sb_height}")
+        # Jobs from a previous attempt are not the blocks this attempt will save.
+        self._block_math.clear()
         batch_size = self.constants.MAX_BLOCK_COUNT_PER_REQUESTS
         counter = 0
         if fork_point_height != 0:
@@ -1423,111 +1805,248 @@ class FullNode:
         peers_with_peak: list[WSChiaConnection] = self.get_peers_with_peak(peak_hash)
 
         async def fetch_blocks() -> AsyncIterator[tuple[WSChiaConnection, list[FullBlock]]]:
-            # the rate limit for respond_blocks is 100 messages / 60 seconds.
-            # But the limit is scaled to 30% for outbound messages, so that's 30
-            # messages per 60 seconds.
-            # That's 2 seconds per request.
+            # One request per peer about every 2 seconds. The turn time is bumped from
+            # its old value, so it may sit behind the wall clock and a peer can be asked
+            # again as soon as the others have been. Localhost stays at 0.1s because tests
+            # depend on it. A peer that answers slowly keeps that turn; only a timeout closes it.
             seconds_per_request = 2
+            # One other due peer is asked for the same range after this. A reply that is
+            # merely slow returns inside a second, so a shorter wait downloads that range
+            # a second time. The next range cannot be validated until this one is in hand.
+            hedge_after = 1.0
+            # Ranges held past the one being checked. Each block is downloaded once.
+            # 4 ranges is 128 blocks. Each of those blocks gets one math job on the
+            # same priority line as the check, lowest height first. The result is kept.
+            ahead_extra_ranges = 4
+            prefetch_limit = 2
 
-            # the timestamp of when the next request_block message is allowed to
-            # be sent. It's initialized to the current time, and bumped by the
-            # seconds_per_request every time we send a request. This ensures we
-            # won't exceed the 100 requests / 60 seconds rate limit.
-            # Whichever peer has the lowest timestamp is the one we request
-            # from. peers that take more than 5 seconds to respond are pushed to
-            # the end of the queue, to be less likely to request from.
-
-            # This should be cleaned up to not be a hard coded value, and maybe
-            # allow higher request rates (and align the request_blocks and
-            # respond_blocks rate limits).
             now = time.monotonic()
             new_peers_with_peak: list[tuple[WSChiaConnection, float]] = [(c, now) for c in peers_with_peak[:]]
             self.log.info(f"peers with peak: {len(new_peers_with_peak)}")
             random.shuffle(new_peers_with_peak)
-            # block request ranges are *inclusive*, this requires some
-            # gymnastics of this range (+1 to make it exclusive, like normal
-            # ranges) and then -1 when forming the request message
-            for start_height in range(fork_point_height, target_peak_sb_height + 1, batch_size):
-                end_height = min(target_peak_sb_height, start_height + batch_size - 1)
-                request = RequestBlocks(uint32(start_height), uint32(end_height), True)
+
+            @dataclasses.dataclass
+            class _Flight:
+                start_height: int
+                end_height: int
+                peer: WSChiaConnection
+                sent_at: float
+                task: asyncio.Task[Any]
+
+            in_flight: list[_Flight] = []
+            ready: dict[int, tuple[WSChiaConnection, list[FullBlock]]] = {}
+            # Program bytes from blocks already in hand, including the range
+            # being checked, so a later block can name them.
+            ahead_generators: dict[int, bytes] = {}
+            logged_spans: set[str] = set()
+            next_yield = int(fork_point_height)
+            target = int(target_peak_sb_height)
+
+            def refresh_peers() -> None:
+                nonlocal new_peers_with_peak
+                if not self.sync_store.peers_changed.is_set():
+                    return
+                existing = {id(conn): stamp for conn, stamp in new_peers_with_peak}
+                # A peer that shows up mid-sync takes the earliest turn already in the list,
+                # so the next batch can come from them instead of waiting behind a clock
+                # that has fallen minutes behind.
+                join_at = min(existing.values()) if existing else time.monotonic()
+                peers = self.get_peers_with_peak(peak_hash)
+                new_peers_with_peak = [(conn, existing.get(id(conn), join_at)) for conn in peers]
+                random.shuffle(new_peers_with_peak)
+                self.sync_store.peers_changed.clear()
+                self.log.info(f"peers with peak: {len(new_peers_with_peak)}")
+
+            def choose_peer() -> tuple[WSChiaConnection, float] | None:
+                busy = {id(flight.peer) for flight in in_flight}
                 new_peers_with_peak.sort(key=lambda pair: pair[1])
-                fetched = False
-                for idx, (peer, timestamp) in enumerate(new_peers_with_peak):
-                    if peer.closed:
+                for peer, stamp in new_peers_with_peak:
+                    if peer.closed or id(peer) in busy:
+                        continue
+                    return peer, stamp
+                return None
+
+            def bump(peer: WSChiaConnection) -> None:
+                step = 0.1 if is_localhost(peer.peer_info.host) else seconds_per_request
+                for index, (conn, stamp) in enumerate(new_peers_with_peak):
+                    if conn is peer:
+                        new_peers_with_peak[index] = (conn, stamp + step)
+                        return
+
+            # How many times in a row this peer answered without the blocks.
+            refusals: dict[int, int] = {}
+
+            def defer_refusing_peer(peer: WSChiaConnection) -> None:
+                count = refusals.get(id(peer), 0) + 1
+                refusals[id(peer)] = count
+                step = 0.1 if is_localhost(peer.peer_info.host) else seconds_per_request
+                due = time.monotonic() + _refusal_backoff_seconds(step, count)
+                for index, (conn, stamp) in enumerate(new_peers_with_peak):
+                    if conn is peer:
+                        new_peers_with_peak[index] = (conn, max(stamp, due))
+                        return
+
+            def send(start_height: int, end_height: int, peer: WSChiaConnection) -> None:
+                bump(peer)
+                timeout = int(30 + 30 / len(new_peers_with_peak))
+                request = RequestBlocks(uint32(start_height), uint32(end_height), True)
+                task = create_referenced_task(
+                    peer.call_api(FullNodeAPI.request_blocks, request, timeout=timeout),
+                )
+                in_flight.append(_Flight(start_height, end_height, peer, time.monotonic(), task))
+
+            async def reap(flight: _Flight) -> None:
+                in_flight.remove(flight)
+                response = await flight.task
+                elapsed = time.monotonic() - flight.sent_at
+                host = flight.peer.peer_info.host
+                span = f"{flight.start_height}-{flight.end_height}"
+                wanted = flight.start_height == next_yield and flight.start_height not in ready
+                if response is None:
+                    self.log.info(f"block request {span} from {host} took {elapsed:.2f}s timeout")
+                    await flight.peer.close()
+                    return
+                if not isinstance(response, RespondBlocks):
+                    # A decline is a normal answer. Leave the peer connected and
+                    # let the other peers take the next turns. Repeating the same
+                    # peer immediately is what produced a burst of refusals.
+                    defer_refusing_peer(flight.peer)
+                    label = _block_reply_label(response)
+                    self.log.info(f"block request {span} from {host} took {elapsed:.2f}s {label}")
+                    return
+                if not await respond_blocks_or_ban(
+                    flight.peer,
+                    response,
+                    flight.start_height,
+                    flight.end_height,
+                    self.log,
+                ):
+                    self.log.info(f"block request {span} from {host} took {elapsed:.2f}s rejected")
+                    return
+                ahead = flight.start_height > next_yield and flight.start_height not in ready
+                if wanted:
+                    outcome = "kept"
+                elif ahead:
+                    outcome = "ahead"
+                else:
+                    outcome = "extra"
+                refusals.pop(id(flight.peer), None)
+                self.log.info(f"block request {span} from {host} took {elapsed:.2f}s {outcome}")
+                if wanted or ahead:
+                    ready[flight.start_height] = (flight.peer, response.blocks)
+                    _remember_block_generators(ahead_generators, response.blocks)
+                    ahead_blocks = [
+                        block for start, (_peer, blocks) in ready.items() if start != next_yield for block in blocks
+                    ]
+                    saved = await self._load_saved_programs(ahead_generators, ahead_blocks)
+                    for height, program in saved.items():
+                        ahead_generators.setdefault(height, program)
+                    self._queue_downloaded_programs(ready, next_yield, ahead_generators, logged_spans)
+
+            async def drain_done() -> None:
+                for flight in [item for item in in_flight if item.task.done()]:
+                    await reap(flight)
+
+            async def wait_out(deadline: float | None) -> None:
+                timeout = None if deadline is None else max(0.0, deadline - time.monotonic())
+                waiters: set[asyncio.Task[Any]] = {flight.task for flight in in_flight}
+                changed: asyncio.Task[Any] | None = None
+                if not self.sync_store.peers_changed.is_set():
+                    changed = create_referenced_task(self.sync_store.peers_changed.wait())
+                    waiters.add(changed)
+                if not waiters:
+                    if timeout is not None and timeout > 0:
+                        await asyncio.sleep(timeout)
+                    return
+                await asyncio.wait(waiters, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
+                if changed is not None and not changed.done():
+                    changed.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await changed
+
+            try:
+                while next_yield <= target:
+                    refresh_peers()
+                    await drain_done()
+                    if next_yield in ready:
+                        peer, blocks = ready.pop(next_yield)
+                        stalled_at = time.monotonic()
+                        yield (peer, blocks)
+                        stalled = time.monotonic() - stalled_at
+                        if stalled > 1:
+                            self.log.info(
+                                f"sync pipeline back-pressure. stalled {stalled:0.2f} seconds on prevalidate block"
+                            )
+                        next_yield = min(target, next_yield + batch_size - 1) + 1
                         continue
 
-                    start = time.monotonic()
-                    if start < timestamp:
-                        # rate limit ourselves, since we sent a message to
-                        # this peer too recently
-                        await asyncio.sleep(timestamp - start)
-                        start = time.monotonic()
-
-                    # update the timestamp, now that we're sending a request
-                    # it's OK for the timestamp to fall behind wall-clock
-                    # time. It just means we're allowed to send more
-                    # requests to catch up
-                    if is_localhost(peer.peer_info.host):
-                        # we don't apply rate limits to localhost, and our
-                        # tests depend on it
-                        bump = 0.1
-                    else:
-                        bump = seconds_per_request
-
-                    new_peers_with_peak[idx] = (
-                        new_peers_with_peak[idx][0],
-                        new_peers_with_peak[idx][1] + bump,
-                    )
-                    # the fewer peers we have, the more willing we should be
-                    # to wait for them.
-                    timeout = int(30 + 30 / len(new_peers_with_peak))
-                    response = await peer.call_api(FullNodeAPI.request_blocks, request, timeout=timeout)
-                    end = time.monotonic()
-                    if response is None:
-                        self.log.info(f"peer timed out after {end - start:.1f} s")
-                        await peer.close()
-                    elif isinstance(response, RespondBlocks):
-                        if not await respond_blocks_or_ban(peer, response, start_height, end_height, self.log):
+                    end_height = min(target, next_yield + batch_size - 1)
+                    current = [flight for flight in in_flight if flight.start_height == next_yield]
+                    chosen = choose_peer()
+                    if not current:
+                        if chosen is None:
+                            if not in_flight:
+                                self.log.error(f"failed fetching {next_yield} to {end_height} from peers")
+                                return
+                            await wait_out(None)
                             continue
-                        if end - start > 5:
-                            self.log.info(f"peer took {end - start:.1f} s to respond to request_blocks")
-                            # this isn't a great peer, reduce its priority
-                            # to prefer any peers that had to wait for it.
-                            # By setting the next allowed timestamp to now,
-                            # means that any other peer that has waited for
-                            # this will have its next allowed timestamp in
-                            # the passed, and be preferred multiple times
-                            # over this peer.
-                            new_peers_with_peak[idx] = (
-                                new_peers_with_peak[idx][0],
-                                end,
-                            )
-                        start = time.monotonic()
-                        yield (peer, response.blocks)
-                        end = time.monotonic()
-                        if end - start > 1:
-                            self.log.info(
-                                f"sync pipeline back-pressure. stalled {end - start:0.2f} seconds on prevalidate block"
-                            )
-                        fetched = True
-                        break
-                if fetched is False:
-                    self.log.error(f"failed fetching {start_height} to {end_height} from peers")
-                    return
-                if self.sync_store.peers_changed.is_set():
-                    existing_peers = {id(c): timestamp for c, timestamp in new_peers_with_peak}
-                    peers = self.get_peers_with_peak(peak_hash)
-                    new_peers_with_peak = [(c, existing_peers.get(id(c), end)) for c in peers]
-                    random.shuffle(new_peers_with_peak)
-                    self.sync_store.peers_changed.clear()
-                    self.log.info(f"peers with peak: {len(new_peers_with_peak)}")
+                        delay = chosen[1] - time.monotonic()
+                        if delay > 0:
+                            await wait_out(time.monotonic() + delay)
+                            continue
+                        send(next_yield, end_height, chosen[0])
+                        continue
+
+                    if (
+                        len(current) == 1
+                        and chosen is not None
+                        and time.monotonic() - current[0].sent_at >= hedge_after
+                        and chosen[1] <= time.monotonic()
+                    ):
+                        send(next_yield, end_height, chosen[0])
+                        continue
+
+                    if self._send_ahead_range(
+                        send,
+                        choose_peer,
+                        in_flight,
+                        ready,
+                        next_yield,
+                        target,
+                        batch_size,
+                        ahead_extra_ranges,
+                        prefetch_limit,
+                    ):
+                        continue
+
+                    hedge_at: float | None = None
+                    if len(current) == 1 and chosen is not None:
+                        hedge_at = max(current[0].sent_at + hedge_after, chosen[1])
+                    await wait_out(hedge_at)
+            finally:
+                pending = [flight.task for flight in in_flight if not flight.task.done()]
+                for task in pending:
+                    task.cancel()
+                for task in pending:
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await task
 
         first_batch = True
         vs = ValidationState(ssi, diff, prev_ses_block)
 
         async def validate_batch(
             item: tuple[WSChiaConnection, list[FullBlock]],
-        ) -> tuple[WSChiaConnection, ValidationState, list[Awaitable[PreValidationResult]], list[FullBlock]] | None:
+        ) -> (
+            tuple[
+                WSChiaConnection,
+                ValidationState,
+                list[Awaitable[PreValidationResult]],
+                list[FullBlock],
+                list[dict[str, float]],
+                float,
+            ]
+            | None
+        ):
             nonlocal first_batch, blockchain, fork_info
             peer, blocks = item
 
@@ -1547,46 +2066,95 @@ class FullNode:
                 return None
 
             first_batch = False
-
-            futures: list[Awaitable[PreValidationResult]] = []
-            for block in blocks_to_validate:
-                futures.extend(
-                    await self.prevalidate_blocks(
-                        blockchain,
-                        [block],
-                        vs,
-                        summaries,
-                    )
+            # Submit the whole batch before any of it is saved. vs still advances
+            # in chain order inside prevalidate_blocks. A block downloaded early
+            # already has its math job; the check waits for that job. One phase
+            # dict per block is filled by that block's worker, then by its save.
+            phases: list[dict[str, float]] = []
+            math_by_hash = {
+                block.header_hash: self._block_math.pop(block.header_hash).futures
+                for block in blocks_to_validate
+                if block.header_hash in self._block_math
+            }
+            prepare_started = time.monotonic()
+            futures = list(
+                await self.prevalidate_blocks(
+                    blockchain,
+                    list(blocks_to_validate),
+                    vs,
+                    summaries,
+                    # Catch-up outranks mempool and peer-block work. Inside the
+                    # catch-up, a lower height outranks a higher one.
+                    phases=phases,
+                    order_by_height=True,
+                    math_by_hash=math_by_hash,
                 )
-            return (peer, next_validation_state, list(futures), blocks_to_validate)
+            )
+            prepare_s = time.monotonic() - prepare_started
+            return (peer, next_validation_state, futures, blocks_to_validate, phases, prepare_s)
 
         block_rate = 0.0
         block_rate_time = time.monotonic()
         block_rate_height = -1
 
         async def ingest_batch(
-            item: tuple[WSChiaConnection, ValidationState, list[Awaitable[PreValidationResult]], list[FullBlock]],
+            item: tuple[
+                WSChiaConnection,
+                ValidationState,
+                list[Awaitable[PreValidationResult]],
+                list[FullBlock],
+                list[dict[str, float]],
+                float,
+            ],
         ) -> None:
             nonlocal fork_info, block_rate, block_rate_time, block_rate_height
-            peer, vs, futures, blocks = item
+            peer, vs, futures, blocks, phases, prepare_s = item
             start_height = blocks[0].height
             end_height = blocks[-1].height
+            ingest_started = time.monotonic()
+            wait_s = 0.0
+            add_s = 0.0
 
             if block_rate_height == -1:
                 block_rate_height = start_height
 
-            pre_validation_results = list(await asyncio.gather(*futures))
-            # The ValidationState object (vs) is an in-out parameter. the add_block_batch()
-            # call will update it
-            state_change_summary, err = await self.add_prevalidated_blocks(
-                blockchain,
-                blocks,
-                pre_validation_results,
-                fork_info,
-                peer.peer_info,
-                vs,
-            )
+            # Save in chain order as soon as that block's check is done. Later
+            # blocks in the batch keep running on the worker threads.
+            state_change_summary = None
+            err = None
+            for i, block in enumerate(blocks):
+                wait_started = time.monotonic()
+                result = await futures[i]
+                wait_s += time.monotonic() - wait_started
+                add_started = time.monotonic()
+                one_summary, err = await self.add_prevalidated_blocks(
+                    blockchain,
+                    [block],
+                    [result],
+                    fork_info,
+                    peer.peer_info,
+                    vs,
+                    phases=[phases[i]],
+                )
+                add_s += time.monotonic() - add_started
+                if one_summary is not None:
+                    if state_change_summary is None:
+                        state_change_summary = one_summary
+                    else:
+                        # Same grouping as add_prevalidated_blocks: keep the original
+                        # fork height and collect every block's coin changes.
+                        state_change_summary = StateChangeSummary(
+                            one_summary.peak,
+                            state_change_summary.fork_height,
+                            state_change_summary.rolled_back_records + one_summary.rolled_back_records,
+                            state_change_summary.removals + one_summary.removals,
+                            state_change_summary.additions + one_summary.additions,
+                            state_change_summary.new_rewards + one_summary.new_rewards,
+                        )
+                if err is not None:
+                    break
             peak: BlockRecord | None = self.blockchain.get_peak()
+            hints_s = 0.0
             if state_change_summary is not None:
                 assert peak is not None
                 # Hints must be added to the DB. The other post-processing tasks are not required when syncing.
@@ -1596,7 +2164,33 @@ class FullNode:
                     self.subscriptions.has_coin_subscription,
                     self.subscriptions.has_puzzle_subscription,
                 )
+                hints_started = time.monotonic()
                 await self.hint_store.add_hints(hints_to_add)
+                hints_s = time.monotonic() - hints_started
+            # Lookup keys are a second write. Index one batch here so that work cannot
+            # pile up and then hold the only chain writer after long sync opens short sync.
+            index_s = 0.0
+            if isinstance(self.coin_store, RocksCoinStore) and state_change_summary is not None:
+                index_started = time.monotonic()
+                await self.coin_store.index_pending()
+                index_s = time.monotonic() - index_started
+            totals = _batch_phase_totals(phases)
+            wall_s = time.monotonic() - ingest_started
+            committed_end = state_change_summary.peak.height if state_change_summary is not None else end_height
+            self.log.info(
+                f"batch timing {start_height}-{committed_end}: wall {wall_s:.2f}s, "
+                f"prepare {prepare_s:.2f}s, wait {wait_s:.2f}s, add {add_s:.2f}s, "
+                f"hints {hints_s:.2f}s, index {index_s:.2f}s, "
+                f"generator-read {totals['generator_read']:.2f}s, "
+                f"clvm-run {totals['clvm_run']:.2f}s (worker sum), "
+                f"header {totals['header']:.2f}s (worker sum), "
+                f"coin-lookup {totals['coin_lookup']:.2f}s ({int(totals['coin_lookups'])}), "
+                f"body {totals['body']:.2f}s, db-write {totals['db_write']:.2f}s, "
+                f"height-map {totals['height_map']:.2f}s, "
+                f"precomputed {int(totals['precomputed'])}, "
+                f"math-ready {int(totals['math_ready'])} of {int(totals['math_queued'])}, "
+                f"math-wait {totals['math_wait']:.2f}s (overlap)"
+            )
             if err is not None:
                 await peer.close(CONSENSUS_ERROR_BAN_SECONDS)
                 if state_change_summary is not None:
@@ -1616,7 +2210,6 @@ class FullNode:
                 block_rate_time = now
                 block_rate_height = end_height
 
-            committed_end = state_change_summary.peak.height if state_change_summary is not None else end_height
             self.log.info(
                 f"Added blocks {start_height} to {committed_end} "
                 f"({block_rate:.3g} blocks/s) (from: {peer.peer_info.ip})"
@@ -1630,7 +2223,7 @@ class FullNode:
 
         async def drain_pending_futures(p: TaskPipeline) -> None:
             for item in p.drain(1):
-                _, _, futures, _ = item
+                _, _, futures, *_rest = item
                 await asyncio.gather(*futures)
 
         pipeline = TaskPipeline(
@@ -1822,6 +2415,11 @@ class FullNode:
         blocks_to_validate: list[FullBlock],
         vs: ValidationState,
         wp_summaries: list[SubEpochSummary] | None = None,
+        nice: tuple[int, ...] = (20,),
+        phases: list[dict[str, float]] | None = None,
+        *,
+        order_by_height: bool = False,
+        math_by_hash: Mapping[bytes32, Sequence[Future[Any]]] | None = None,
     ) -> Sequence[Awaitable[PreValidationResult]]:
         """
         This is a thin wrapper over pre_validate_block().
@@ -1841,6 +2439,14 @@ class FullNode:
         # object we pass in.
         ret: list[Awaitable[PreValidationResult]] = []
         for block in blocks_to_validate:
+            # A separate dict per block. The worker writes clvm and header into it
+            # while the next block is still being prepared here.
+            phase: dict[str, float] | None = None
+            if phases is not None:
+                phase = {}
+                phases.append(phase)
+            block_nice = (0, int(block.height)) if order_by_height else nice
+            block_math = None if math_by_hash is None else math_by_hash.get(block.header_hash)
             ret.append(
                 await pre_validate_block(
                     self.constants,
@@ -1850,7 +2456,9 @@ class FullNode:
                     None,
                     vs,
                     wp_summaries=wp_summaries,
-                    nice=(20,),
+                    nice=block_nice,
+                    phase_times=phase,
+                    math_futures=block_math,
                 )
             )
         return ret
@@ -1863,6 +2471,7 @@ class FullNode:
         fork_info: ForkInfo,
         peer_info: PeerInfo,
         vs: ValidationState,  # in-out parameter
+        phases: list[dict[str, float]] | None = None,
     ) -> tuple[StateChangeSummary | None, Err | None]:
         agg_state_change_summary: StateChangeSummary | None = None
         for i, block in enumerate(blocks_to_validate):
@@ -1900,6 +2509,7 @@ class FullNode:
                 fork_info,
                 prev_ses_block=vs.prev_ses_block,
                 block_record=block_rec,
+                phase_times=None if phases is None else phases[i],
             )
             if error is None:
                 blockchain.remove_extra_block(header_hash)
@@ -1982,8 +2592,14 @@ class FullNode:
         blocks that we have finalized recently.
         """
         self.log.info("long sync done")
+        # Short sync takes the same chain writer. Finish any lookup keys still waiting
+        # while sync mode is still on, so the next block is not stuck behind one huge write.
+        if isinstance(self._coin_store, RocksCoinStore):
+            await self._coin_store.index_pending_all()
         self.sync_store.set_long_sync(False)
         self.sync_store.set_sync_mode(False)
+        if self._chain_db is not None:
+            self._chain_db.pause_file_chip(False)
         self._state_changed("sync_mode")
         if self._server is None:
             return None
@@ -2290,6 +2906,38 @@ class FullNode:
 
         self._state_changed("new_peak")
 
+    def _offer_file_chip(self) -> None:
+        """Pack one small slice after a normal block, when nothing else needs the disk.
+
+        Long sync never starts one. After a one-block walk, a slow save or a
+        save that is already waiting skips the slice. A short batch of many
+        blocks does not time its saves, so the one chance after that batch can
+        still pack. The pack reads the live files itself, so a reorg that
+        rewrote a height is packed from those new files.
+        """
+        chain = self._chain_db
+        if chain is None or self.sync_store.get_long_sync() or self.sync_store.get_sync_mode():
+            return
+        if self.sync_store.batch_syncing or self.sync_store.any_backtrack_syncing():
+            return
+        slow = self._file_chip_save_noted and self._last_db_write_seconds >= SLOW_SAVE_SECONDS
+        waiting = self._last_save_had_waiters or self.blockchain.priority_mutex.has_waiters()
+        self._last_save_had_waiters = False
+        self._file_chip_save_noted = False
+        chain.request_file_chip(long_sync=False, save_waiting=waiting, last_save_slow=slow)
+
+    async def _offer_file_chip_when_idle(self) -> None:
+        """Take the chain lock at low priority, then pack only if no save is waiting.
+
+        A block save uses high priority, so it runs first. The check happens
+        while this task holds the lock. SQLite leaves the chain database unset
+        and returns before this lock.
+        """
+        if self._chain_db is None:
+            return
+        async with self.blockchain.priority_mutex.acquire(priority=BlockchainMutexPriority.low):
+            self._offer_file_chip()
+
     async def add_block(
         self,
         block: FullBlock,
@@ -2500,6 +3148,15 @@ class FullNode:
                 raise
 
             validation_time = time.monotonic() - validation_start
+            if added == AddBlockResult.NEW_PEAK and self._chain_db is not None:
+                # Still holding the chain lock, so a save that is already queued
+                # is visible. Short sync notes the save and packs once, after the
+                # whole batch, instead of between its blocks. SQLite leaves the
+                # chain database unset and skips this.
+                self._last_db_write_seconds = phase_times.get("db_write", 0.0)
+                self._last_save_had_waiters = self.blockchain.priority_mutex.has_waiters()
+                self._file_chip_save_noted = True
+                self._offer_file_chip()
 
         if ppp_result is not None:
             assert state_change_summary is not None
@@ -2525,6 +3182,14 @@ class FullNode:
             removals = len(conds_for_counts.spends)
             additions = sum(len(spend.create_coin) for spend in conds_for_counts.spends)
         ref_count = len(block.transactions_generator_ref_list)
+        fork_note = ""
+        if state_change_summary is not None and int(state_change_summary.fork_height) < int(block.height) - 1:
+            fork_additions = len(state_change_summary.additions) + len(state_change_summary.new_rewards)
+            fork_note = (
+                f"fork-at: {state_change_summary.fork_height}, "
+                f"rolled-back: {len(state_change_summary.rolled_back_records)}, "
+                f"fork-additions: {fork_additions}, "
+            )
         if validation_time > 2:
             log_level = logging.WARNING
         elif added == AddBlockResult.NEW_PEAK:
@@ -2545,7 +3210,7 @@ class FullNode:
             f"add-block: {add_block_time:0.2f}s, "
             f"post-process: {post_process_time:0.2f}s, "
             f"post-process2: {post_process_time2:0.2f}s, "
-            f"additions: {additions}, removals: {removals}, refs: {ref_count}, "
+            f"additions: {additions}, removals: {removals}, {fork_note}refs: {ref_count}, "
             f"cached: {'yes' if reused_unfinished else 'no'}, "
             f"cost: {block.transactions_info.cost if block.transactions_info is not None else 'None'}"
             f"{percent_full_str} header_hash: {header_hash.hex()} height: {block.height}",
