@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import logging
+import threading
 import traceback
+from collections import OrderedDict
 from enum import IntEnum
 from functools import lru_cache
 
@@ -17,12 +19,53 @@ log = logging.getLogger(__name__)
 __all__ = ["VDFInfo", "VDFProof"]
 
 
-@lru_cache(maxsize=200)
+# One build per challenge. lru_cache lets every thread that arrives together run the
+# build, and validation does that on every batch. Different challenges still run together.
+# A long sync holds several hundred blocks between the early build and the check, and a
+# block adds more than one reward-chain challenge. 1024 dropped that early number before
+# its turn. Each saved value is one 1024-bit integer.
+_DISCRIMINANT_CACHE_SIZE = 4096
+_discriminant_lock = threading.Lock()
+_discriminant_ready: OrderedDict[tuple[bytes, int], int] = OrderedDict()
+_discriminant_inflight: dict[tuple[bytes, int], threading.Event] = {}
+
+
 def get_discriminant(challenge: bytes32, size_bites: int) -> int:
-    return int(
-        create_discriminant(challenge, size_bites),
-        16,
-    )
+    key = (bytes(challenge), size_bites)
+    with _discriminant_lock:
+        cached = _discriminant_ready.get(key)
+        if cached is not None:
+            _discriminant_ready.move_to_end(key)
+            return cached
+        pending = _discriminant_inflight.get(key)
+        if pending is None:
+            pending = threading.Event()
+            _discriminant_inflight[key] = pending
+            owner = True
+        else:
+            owner = False
+    if not owner:
+        pending.wait()
+        with _discriminant_lock:
+            cached = _discriminant_ready.get(key)
+        if cached is None:
+            return get_discriminant(challenge, size_bites)
+        return cached
+    try:
+        value = int(create_discriminant(challenge, size_bites), 16)
+    except Exception:
+        with _discriminant_lock:
+            _discriminant_inflight.pop(key, None)
+        pending.set()
+        raise
+    with _discriminant_lock:
+        _discriminant_ready[key] = value
+        _discriminant_ready.move_to_end(key)
+        while len(_discriminant_ready) > _DISCRIMINANT_CACHE_SIZE:
+            _discriminant_ready.popitem(last=False)
+        _discriminant_inflight.pop(key, None)
+    pending.set()
+    return value
 
 
 @lru_cache(maxsize=1000)
