@@ -983,17 +983,27 @@ async def test_add_coin_records_to_db(coin_engine: str, tmp_path: Path) -> None:
 
 @pytest.mark.anyio
 async def test_get_coin_records_by_parent_ids_max_items(coin_engine: str, tmp_path: Path) -> None:
-    parent_id = bytes32(std_hash(b"parent"))
+    parent_coin = Coin(bytes32([1] * 32), bytes32([2] * 32), uint64(1))
+    parent_id = parent_coin.name()
     async with open_coin_stores(tmp_path, coin_engine) as (coin_store, _hint_store):
         records = [
             CoinRecord(
-                coin=Coin(parent_id, std_hash(i.to_bytes(4, byteorder="big")), uint64(i + 1)),
-                confirmed_block_index=uint32(1),
-                spent_block_index=uint32(0),
+                coin=parent_coin,
+                confirmed_block_index=uint32(0),
+                spent_block_index=uint32(1),
                 coinbase=False,
                 timestamp=uint64(10000),
-            )
-            for i in range(200)
+            ),
+            *[
+                CoinRecord(
+                    coin=Coin(parent_id, std_hash(i.to_bytes(4, byteorder="big")), uint64(i + 1)),
+                    confirmed_block_index=uint32(1),
+                    spent_block_index=uint32(0),
+                    coinbase=False,
+                    timestamp=uint64(10000),
+                )
+                for i in range(200)
+            ],
         ]
         await add_coin_records_to_db(coin_store, records)
 
@@ -1014,9 +1024,20 @@ async def test_get_coin_records_by_parent_ids_max_items_across_batches(
 ) -> None:
     # Force multiple batches so we verify the global limit is enforced across batches.
     monkeypatch.setattr("chia.full_node.coin_store.SQLITE_MAX_VARIABLE_NUMBER", 5)
-    parent_ids = [bytes32(std_hash(i.to_bytes(4, byteorder="big"))) for i in range(8)]
+    parents = [Coin(bytes32([i + 1] * 32), bytes32([9] * 32), uint64(i + 1)) for i in range(8)]
+    parent_ids = [parent.name() for parent in parents]
     async with open_coin_stores(tmp_path, coin_engine) as (coin_store, _hint_store):
         records = [
+            CoinRecord(
+                coin=parent,
+                confirmed_block_index=uint32(0),
+                spent_block_index=uint32(1),
+                coinbase=False,
+                timestamp=uint64(10000),
+            )
+            for parent in parents
+        ]
+        records.extend(
             CoinRecord(
                 coin=Coin(parent_id, std_hash(b"shared-ph"), uint64(i + 1)),
                 confirmed_block_index=uint32(1),
@@ -1025,7 +1046,7 @@ async def test_get_coin_records_by_parent_ids_max_items_across_batches(
                 timestamp=uint64(10000),
             )
             for i, parent_id in enumerate(parent_ids)
-        ]
+        )
         await add_coin_records_to_db(coin_store, records)
 
         results = await coin_store.get_coin_records_by_parent_ids(True, parent_ids, max_items=7)
@@ -1036,17 +1057,27 @@ async def test_get_coin_records_by_parent_ids_max_items_across_batches(
 async def test_get_coin_records_by_parent_ids_respects_spent_filter_under_limit(
     coin_engine: str, tmp_path: Path
 ) -> None:
-    parent_id = bytes32(std_hash(b"spent-filter-parent"))
+    parent_coin = Coin(bytes32([4] * 32), bytes32([5] * 32), uint64(1))
+    parent_id = parent_coin.name()
     async with open_coin_stores(tmp_path, coin_engine) as (coin_store, _hint_store):
         records = [
             CoinRecord(
-                coin=Coin(parent_id, std_hash(i.to_bytes(4, byteorder="big")), uint64(i + 1)),
-                confirmed_block_index=uint32(1),
-                spent_block_index=uint32(5) if i % 2 == 0 else uint32(0),
+                coin=parent_coin,
+                confirmed_block_index=uint32(0),
+                spent_block_index=uint32(1),
                 coinbase=False,
                 timestamp=uint64(10000),
-            )
-            for i in range(10)
+            ),
+            *[
+                CoinRecord(
+                    coin=Coin(parent_id, std_hash(i.to_bytes(4, byteorder="big")), uint64(i + 1)),
+                    confirmed_block_index=uint32(1),
+                    spent_block_index=uint32(5) if i % 2 == 0 else uint32(0),
+                    coinbase=False,
+                    timestamp=uint64(10000),
+                )
+                for i in range(10)
+            ],
         ]
         await add_coin_records_to_db(coin_store, records)
 
