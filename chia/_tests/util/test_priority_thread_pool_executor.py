@@ -318,3 +318,60 @@ def test_no_dedicated_threads() -> None:
     with PriorityThreadPoolExecutor(max_workers=2) as pool:
         f = pool.submit(lambda: 42, dedicated=True)
         assert f.result(timeout=5) == 42
+
+
+def test_lower_height_runs_before_a_higher_one_and_a_finished_result_stays() -> None:
+    """One line: a lower block runs first, and its result is still there afterward."""
+    release = threading.Event()
+    started = threading.Event()
+    order: list[int] = []
+
+    def occupy() -> None:
+        started.set()
+        release.wait(5)
+
+    def record(height: int) -> int:
+        order.append(height)
+        return height
+
+    with PriorityThreadPoolExecutor(max_workers=1, thread_name_prefix="t-") as pool:
+        try:
+            pool.submit(occupy, nice=(0, 0))
+            assert started.wait(5)
+            higher = pool.submit(record, 40, nice=(0, 40))
+            lower = pool.submit(record, 10, nice=(0, 10))
+            other = pool.submit(record, 7, nice=(5,))
+            release.set()
+            assert lower.result(timeout=5) == 10
+            assert higher.result(timeout=5) == 40
+            assert other.result(timeout=5) == 7
+            assert order == [10, 40, 7]
+        finally:
+            release.set()
+
+
+def test_spare_workers_take_the_next_heights() -> None:
+    """Cores left after the lowest blocks have started take the next heights."""
+    release = threading.Event()
+    lock = threading.Lock()
+    running: list[int] = []
+    enough = threading.Event()
+
+    def work(height: int) -> None:
+        with lock:
+            running.append(height)
+            if len(running) == 4:
+                enough.set()
+        release.wait(5)
+
+    with PriorityThreadPoolExecutor(max_workers=4, dedicated=1, thread_name_prefix="t-") as pool:
+        try:
+            pool.submit(work, 1, nice=(0, 1), dedicated=True)
+            pool.submit(work, 2, nice=(0, 2), dedicated=True)
+            for height in range(3, 7):
+                pool.submit(work, height, nice=(0, height), dedicated=False)
+            assert enough.wait(5)
+            with lock:
+                assert sorted(running) == [1, 2, 3, 4]
+        finally:
+            release.set()

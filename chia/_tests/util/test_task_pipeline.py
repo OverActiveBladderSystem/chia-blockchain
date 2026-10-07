@@ -320,12 +320,54 @@ async def test_get_or_bail_slow_path_item_arrives() -> None:
 
 
 @pytest.mark.anyio
-async def test_cancellation_calls_cleanup() -> None:
-    """Cancelling the run() task still invokes the cleanup callback."""
-    cleanup_called = asyncio.Event()
+async def test_cleanup_runs_after_the_pipeline_finishes() -> None:
+    """A finished pipeline still drains work the last stage did not take."""
+    called = False
 
     async def cleanup(p: TaskPipeline) -> None:
-        cleanup_called.set()
+        nonlocal called
+        called = True
+
+    async def collect(x: int) -> None:
+        pass
+
+    pipeline = TaskPipeline(source=_count_up(2), stages=[collect], cleanup=cleanup)
+    await pipeline.run()
+
+    assert called
+
+
+@pytest.mark.anyio
+async def test_cleanup_runs_when_a_stage_fails() -> None:
+    called = False
+
+    async def cleanup(p: TaskPipeline) -> None:
+        nonlocal called
+        called = True
+
+    async def failing(x: int) -> None:
+        raise ValueError("nope")
+
+    pipeline = TaskPipeline(source=_count_up(1), stages=[failing], cleanup=cleanup)
+    with pytest.raises(ValueError, match="nope"):
+        await pipeline.run()
+
+    assert called
+
+
+@pytest.mark.anyio
+async def test_cancellation_skips_cleanup() -> None:
+    """A cancelled pipeline must not wait on cleanup.
+
+    Long-sync shutdown cancels the pipeline while block checks are still
+    outstanding. Waiting on those checks kept the node from closing its database.
+    """
+    entered = False
+
+    async def cleanup(p: TaskPipeline) -> None:
+        nonlocal entered
+        entered = True
+        await asyncio.sleep(30)
 
     async def slow_source() -> AsyncIterator[int]:
         for i in range(1000):
@@ -340,9 +382,9 @@ async def test_cancellation_calls_cleanup() -> None:
     await asyncio.sleep(0.05)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await task
+        await asyncio.wait_for(task, timeout=2)
 
-    assert cleanup_called.is_set()
+    assert entered is False
 
 
 @pytest.mark.anyio

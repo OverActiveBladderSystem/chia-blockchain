@@ -520,6 +520,24 @@ async def test_multiple_tasks_track_active_task_accurately() -> None:
 
 
 @pytest.mark.anyio
+async def test_has_waiters_sees_a_task_queued_behind_the_holder() -> None:
+    mutex = PriorityMutex.create(priority_type=MutexPriority)
+    assert not mutex.has_waiters()
+
+    async def wait_for_it() -> None:
+        async with mutex.acquire(priority=MutexPriority.low):
+            return
+
+    async with mutex.acquire(priority=MutexPriority.high):
+        assert not mutex.has_waiters()
+        waiter = create_referenced_task(wait_for_it())
+        await wait_queued(mutex=mutex, task=waiter)
+        assert mutex.has_waiters()
+    await waiter
+    assert not mutex.has_waiters()
+
+
+@pytest.mark.anyio
 async def test_no_task_fails_as_expected(monkeypatch: pytest.MonkeyPatch) -> None:
     """Note that this case is not expected to be possible in reality"""
     mutex = PriorityMutex.create(priority_type=MutexPriority)
