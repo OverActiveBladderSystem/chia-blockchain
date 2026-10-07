@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import shutil
 import time
 from collections.abc import Awaitable, Callable
@@ -24,7 +25,6 @@ from chia.full_node.db.keys import (
     CF_BLOCKS_AT_HEIGHT,
     CF_COINS,
     CF_COINS_BY_CONFIRMED,
-    CF_COINS_BY_PARENT,
     CF_COINS_BY_PUZZLE_CONFIRMED,
     CF_COINS_BY_PUZZLE_SPENT,
     CF_COINS_BY_SPENT,
@@ -38,6 +38,7 @@ from chia.full_node.db.keys import (
     META_COMPLETE,
     META_FORMAT,
     META_FORMAT_VALUE,
+    META_MIGRATE_BLOCK_ROWID,
     META_MIGRATE_HEIGHT,
     META_MIGRATE_PHASE,
     META_MIGRATE_ROWID,
@@ -48,6 +49,7 @@ from chia.full_node.db.keys import (
 from chia.full_node.db.rocks import RocksBackend
 from chia.full_node.db.startup import unfinished_migration_reason
 from chia.types.blockchain_format.coin import Coin
+from chia.util.task_referencer import create_referenced_task
 
 log = logging.getLogger(__name__)
 
@@ -59,6 +61,7 @@ _COIN_BATCH = 50000
 _HINT_BATCH = 20000
 _SUMMARY_BATCH = 8
 _SUMMARY_BYTES = 32 * 1024 * 1024
+_HEIGHT_WINDOW = 100_000
 _MERGE_FAMILIES: tuple[tuple[str, str], ...] = (
     (CF_BLOCK_BLOBS, "block files"),
     (CF_BLOCK_META, "block records"),
@@ -70,7 +73,6 @@ _MERGE_FAMILIES: tuple[tuple[str, str], ...] = (
     (CF_COINS_BY_SPENT, "spent coins"),
     (CF_COINS_BY_PUZZLE_CONFIRMED, "coins by puzzle"),
     (CF_COINS_BY_PUZZLE_SPENT, "spent coins by puzzle"),
-    (CF_COINS_BY_PARENT, "coins by parent"),
     (CF_FF_UNSPENT, "fast-forward coins"),
     (CF_HINTS_BY_COIN, "hints by coin"),
     (CF_HINTS_BY_HINT, "hints by hint"),
@@ -146,6 +148,8 @@ def format_progress(
         return line
     rate = done_this_run / window
     remaining = progress.work_total - progress.work_done
+    if progress.phase == "pack":
+        return f"{line}  {rate / (1024 * 1024):,.0f} MB/s  ETA {_format_eta(remaining / rate)}"
     unit = {
         "blocks": "rows/s",
         "chain": "rows/s",
@@ -401,25 +405,10 @@ async def _copy_blocks(
             await cursor.close()
             if len(rows) == 0:
                 break
-            pending: list[tuple[bytes32, bytes32, int, bytes | None, bool, bool, bytes, bytes]] = []
-            for row in rows:
-                rowid = int(row[0])
-                height = int(row[3])
-                highest = max(highest, height)
-                ses = row[4]
-                pending.append(
-                    (
-                        bytes32(row[1]),
-                        bytes32(row[2]),
-                        height,
-                        None if ses is None else bytes(ses),
-                        bool(row[5]),
-                        bool(row[6]),
-                        bytes(row[7]),
-                        bytes(row[8]),
-                    )
-                )
-            await block_store.import_block_rows(pending)
+            rowid, batch_height, pending = _copied_block_batch(rows)
+            highest = max(highest, batch_height)
+            # The chain index is rebuilt from SQLite after this copy, so skip it here.
+            await block_store.import_block_rows(pending, assume_new=True, record_chain=False)
             await _put_meta_many(
                 chain,
                 [
@@ -439,8 +428,18 @@ async def _copy_blocks(
                     work_total=copied_rows,
                 ),
             )
-    await _put_meta(chain, META_MIGRATE_PHASE, b"coins")
-    await _put_meta(chain, META_MIGRATE_ROWID, (0).to_bytes(8, "little", signed=False))
+    # Coin progress reuses the rowid key, so keep the block cutoff in its own key.
+    block_cutoff = await _meta(chain, META_MIGRATE_ROWID)
+    if block_cutoff is None:
+        block_cutoff = (0).to_bytes(8, "little", signed=False)
+    await _put_meta_many(
+        chain,
+        [
+            (META_MIGRATE_BLOCK_ROWID, block_cutoff),
+            (META_MIGRATE_PHASE, b"coins"),
+            (META_MIGRATE_ROWID, (0).to_bytes(8, "little", signed=False)),
+        ],
+    )
 
 
 async def _copy_snapshot(
@@ -454,6 +453,14 @@ async def _copy_snapshot(
     *,
     assume_source_headroom: bool,
 ) -> None:
+    saved_block_rowid = await _meta(chain, META_MIGRATE_BLOCK_ROWID)
+    if saved_block_rowid is None:
+        raise RuntimeError(
+            "This unfinished copy was started before the faster chain step. "
+            "Delete it with chia db migrate --abort and the same --output folder, then start the migration again. "
+            "The SQLite database was not changed."
+        )
+    block_rowid = _u64(saved_block_rowid)
     log.info("copying coin snapshot")
     _report(progress, MigrateProgress("chain", 0, 1, "preparing the coin copy"))
     if not assume_source_headroom:
@@ -464,6 +471,47 @@ async def _copy_snapshot(
         await db.execute("BEGIN")
         try:
             peak_hash, peak_height = await _peak(db)
+            # The snapshot can include blocks committed after step 1. Copy those blobs first.
+            # The chain index below is written from these SQLite columns and does not read RocksDB.
+            gap_total = await _count(db, "SELECT COUNT(*) FROM full_blocks WHERE rowid>?", (block_rowid,))
+            if gap_total:
+                _report(
+                    progress,
+                    MigrateProgress(
+                        "chain",
+                        0,
+                        gap_total,
+                        "copying blocks that arrived after the block step",
+                        work_total=gap_total,
+                    ),
+                )
+                gap_rowid = block_rowid
+                gap_seen = 0
+                while True:
+                    _check_stop(stop)
+                    cursor = await db.execute(
+                        "SELECT rowid, header_hash, prev_hash, height, sub_epoch_summary, is_fully_compactified, "
+                        "in_main_chain, block, block_record FROM full_blocks WHERE rowid>? ORDER BY rowid LIMIT ?",
+                        (gap_rowid, _BLOCK_BATCH),
+                    )
+                    gap_rows = await cursor.fetchall()
+                    await cursor.close()
+                    if len(gap_rows) == 0:
+                        break
+                    gap_rowid, _gap_height, pending = _copied_block_batch(gap_rows)
+                    await block_store.import_block_rows(pending, assume_new=True, record_chain=False)
+                    gap_seen += len(pending)
+                    _report(
+                        progress,
+                        MigrateProgress(
+                            "chain",
+                            gap_seen,
+                            gap_total,
+                            "copying blocks that arrived after the block step",
+                            work_done=gap_seen,
+                            work_total=max(gap_total, gap_seen),
+                        ),
+                    )
             block_total = await _count(db, "SELECT COUNT(*) FROM full_blocks")
             _report(
                 progress,
@@ -476,18 +524,30 @@ async def _copy_snapshot(
                 ),
             )
             await block_store.clear_main_chain_index()
-            cursor = await db.execute("SELECT header_hash, in_main_chain, is_fully_compactified FROM full_blocks")
+            cursor = await db.execute(
+                "SELECT header_hash, prev_hash, height, sub_epoch_summary, is_fully_compactified, "
+                "in_main_chain, block_record FROM full_blocks"
+            )
             seen = 0
             while True:
                 _check_stop(stop)
                 fetched = await cursor.fetchmany(_CHAIN_BATCH)
                 if len(fetched) == 0:
                     break
-                membership = [
-                    (bytes32(header_hash), bool(in_chain), bool(compact)) for header_hash, in_chain, compact in fetched
+                snapshot = [
+                    (
+                        bytes32(header_hash),
+                        bytes32(prev_hash),
+                        int(height),
+                        None if ses is None else bytes(ses),
+                        bool(compact),
+                        bool(in_chain),
+                        bytes(block_record),
+                    )
+                    for header_hash, prev_hash, height, ses, compact, in_chain, block_record in fetched
                 ]
-                await block_store.apply_membership(membership)
-                seen += len(membership)
+                await block_store.apply_chain_snapshot(snapshot)
+                seen += len(snapshot)
                 _report(
                     progress,
                     MigrateProgress(
@@ -500,6 +560,7 @@ async def _copy_snapshot(
                     ),
                 )
             await cursor.close()
+            await block_store.mark_ses_index_ready()
 
             total = await _count(db, "SELECT COUNT(*) FROM coin_record")
             _report(
@@ -551,28 +612,119 @@ async def _copy_snapshot(
     await _put_meta(chain, META_MIGRATE_PHASE, b"merge")
 
 
+_PACK_MARKS = 1000
+
+
+def _sst_directory_stats(path: Path) -> tuple[int, int]:
+    """Return the count and total size of table files in a RocksDB directory."""
+    count = 0
+    total = 0
+    try:
+        entries = os.scandir(path)
+    except FileNotFoundError:
+        return 0, 0
+    with entries:
+        for entry in entries:
+            if not entry.name.endswith(".sst"):
+                continue
+            count += 1
+            try:
+                total += entry.stat(follow_symlinks=False).st_size
+            except OSError:
+                continue
+    return count, total
+
+
+def _pack_credit(seen: int, grown: int, family_bytes: int) -> int:
+    """Bytes of this group to count while it is still packing. Never moves backward."""
+    if family_bytes <= 0 or grown <= 0:
+        return seen
+    # Leave the last sliver until the group actually finishes, so the line does not hit 100% early.
+    return min(family_bytes * 95 // 100, max(seen, grown))
+
+
+def _pack_marks(done: int, total: int) -> tuple[int, int]:
+    if total <= 0:
+        return 0, _PACK_MARKS
+    return min(_PACK_MARKS, (_PACK_MARKS * max(0, done)) // total), _PACK_MARKS
+
+
+def _pack_detail(label: str, files: int, written: int) -> str:
+    if written >= 1024 * 1024 * 1024:
+        amount = f"{written / (1024 * 1024 * 1024):.1f} GB"
+    else:
+        amount = f"{written / (1024 * 1024):.0f} MB"
+    return f"packing {label}, {amount} written, {files:,} files on disk"
+
+
 async def _merge_stored_files(
     chain: ChainDB,
     progress: Callable[[MigrateProgress], None] | None,
     stop: asyncio.Event | None,
+    *,
+    families: tuple[tuple[str, str], ...] | None = None,
+    poll_seconds: float = 2.0,
 ) -> None:
-    """One merge after the copy, instead of merging continuously while coins are written."""
-    total = len(_MERGE_FAMILIES)
-    for index, (family, label) in enumerate(_MERGE_FAMILIES, start=1):
+    """One merge after the copy, instead of merging continuously while coins are written.
+
+    A group can rewrite for minutes before it finishes. The line follows files on disk
+    during that rewrite so it does not sit on one percent until the group ends.
+    """
+    groups = _MERGE_FAMILIES if families is None else families
+    sizes = await chain.stored_family_bytes([name for name, _label in groups])
+    if sum(sizes.values()) <= 0:
+        sizes = {name: 1 for name, _label in groups}
+    total_bytes = sum(sizes.values())
+    done_bytes = 0
+    directory = chain.directory()
+    for family, label in groups:
         _check_stop(stop)
+        family_bytes = sizes.get(family, 0)
+        _start_files, start_bytes = _sst_directory_stats(directory)
+        credit = 0
+        packing = create_referenced_task(chain.merge_families([family]), name=f"pack-{family}")
+        while not packing.done():
+            files, current_bytes = _sst_directory_stats(directory)
+            credit = _pack_credit(credit, max(0, current_bytes - start_bytes), family_bytes)
+            marks, mark_total = _pack_marks(done_bytes + credit, total_bytes)
+            _report(
+                progress,
+                MigrateProgress(
+                    "pack",
+                    marks,
+                    mark_total,
+                    _pack_detail(label, files, credit),
+                    work_done=done_bytes + credit,
+                    work_total=total_bytes,
+                ),
+            )
+            await asyncio.wait({packing}, timeout=poll_seconds)
+        await packing
+        done_bytes += family_bytes
+        files, _current_bytes = _sst_directory_stats(directory)
+        marks, mark_total = _pack_marks(done_bytes, total_bytes)
         _report(
             progress,
             MigrateProgress(
                 "pack",
-                index - 1,
-                total,
-                f"packing {label}",
-                work_done=index - 1,
-                work_total=total,
+                marks,
+                mark_total,
+                _pack_detail(label, files, family_bytes),
+                work_done=done_bytes,
+                work_total=total_bytes,
             ),
         )
-        await chain.merge_families([family])
-    _report(progress, MigrateProgress("pack", total, total, "packed the database files", work_done=total, work_total=total))
+    _report(
+        progress,
+        MigrateProgress(
+            "pack",
+            _PACK_MARKS,
+            _PACK_MARKS,
+            "packed the database files",
+            work_done=total_bytes,
+            work_total=total_bytes,
+        ),
+    )
 
 
 async def _copy_hints_and_ses(
@@ -687,6 +839,89 @@ async def _copy_sub_epoch_segments(
     await cursor.close()
 
 
+async def _write_startup_files_from_index(
+    blockchain_dir: Path,
+    block_store: RocksBlockStore,
+    selected_network: str,
+    progress: Callable[[MigrateProgress], None] | None,
+    stop: asyncio.Event | None,
+    peak_row: tuple[bytes32, bytes32, uint32, bytes | None],
+) -> None:
+    """Fill the startup files from the chain index and the saved sub-epoch summaries."""
+    peak_hash = bytes(peak_row[0])
+    peak_height = int(peak_row[2])
+    target = max(peak_height, 1)
+    hashes = bytearray((peak_height + 1) * 32)
+    seen = bytearray(peak_height + 1)
+    filled = 0
+    _report(progress, MigrateProgress("height", 0, target, "writing height-to-hash", work_total=target))
+    for start in range(0, peak_height + 1, _HEIGHT_WINDOW):
+        _check_stop(stop)
+        stop_at = min(peak_height, start + _HEIGHT_WINDOW - 1)
+        for height, header_hash in await block_store.main_chain_window(start, stop_at):
+            if height > peak_height or seen[height]:
+                continue
+            hashes[height * 32 : (height + 1) * 32] = bytes(header_hash)
+            seen[height] = 1
+            filled += 1
+        done = min(stop_at + 1, target)
+        _report(
+            progress,
+            MigrateProgress(
+                "height",
+                done,
+                target,
+                "writing height-to-hash",
+                work_done=done,
+                work_total=target,
+            ),
+        )
+    if filled != peak_height + 1 or bytes(hashes[peak_height * 32 : (peak_height + 1) * 32]) != peak_hash:
+        raise ValueError(
+            "The chain index is missing a main-chain block. height-to-hash and sub-epoch-summaries were not written."
+        )
+    summaries = {
+        height: summary
+        for height, summary in (await block_store.stored_sub_epoch_summaries()).items()
+        if height <= peak_height
+    }
+    await BlockHeightMap.write_startup_files(blockchain_dir, selected_network, hashes, summaries)
+    _report(
+        progress,
+        MigrateProgress(
+            "height",
+            target,
+            target,
+            "writing height-to-hash",
+            work_done=target,
+            work_total=target,
+        ),
+    )
+    summary_count = len(summaries)
+    summary_target = max(summary_count, 1)
+    _report(
+        progress,
+        MigrateProgress(
+            "epochs",
+            0,
+            summary_target,
+            "writing sub-epoch-summaries",
+            work_total=summary_target,
+        ),
+    )
+    _report(
+        progress,
+        MigrateProgress(
+            "epochs",
+            summary_count,
+            summary_target,
+            "writing sub-epoch-summaries",
+            work_done=summary_count,
+            work_total=summary_target,
+        ),
+    )
+
+
 async def _write_startup_cache(
     blockchain_dir: Path,
     block_store: RocksBlockStore,
@@ -694,9 +929,16 @@ async def _write_startup_cache(
     progress: Callable[[MigrateProgress], None] | None,
     stop: asyncio.Event | None,
 ) -> None:
-    """Write height-to-hash and sub-epoch-summaries beside the RocksDB directory, at its current peak."""
+    """Write height-to-hash and sub-epoch-summaries beside the RocksDB directory, at its current peak.
+
+    These files are created here even when the node was not running and neither file exists yet.
+    They are not copied from the SQLite folder.
+    """
     row = await block_store.peak_height_map_row()
     if row is None:
+        return
+    if await block_store.ses_index_ready():
+        await _write_startup_files_from_index(blockchain_dir, block_store, selected_network, progress, stop, row)
         return
     peak_height = int(row[2])
     target = max(peak_height, 1)
@@ -844,6 +1086,8 @@ async def _apply_followed_block(
         bytes(row[7]),
     )
     await block_store.set_in_chain([(header_hash,)])
+    ses_raw = row[3]
+    await block_store.note_main_chain_ses(height, None if ses_raw is None else bytes(ses_raw))
     additions: list[tuple[bytes32, Coin, bool]] = []
     rewards: list[Coin] = []
     removals: list[bytes32] = []
@@ -961,11 +1205,38 @@ async def _main_block_row(db: aiosqlite.Connection, height: int) -> aiosqlite.Ro
     return row
 
 
-async def _count(db: aiosqlite.Connection, sql: str) -> int:
-    cursor = await db.execute(sql)
+async def _count(db: aiosqlite.Connection, sql: str, params: tuple[object, ...] = ()) -> int:
+    cursor = await db.execute(sql, params)
     row = await cursor.fetchone()
     await cursor.close()
     return 0 if row is None else int(row[0])
+
+
+def _copied_block_batch(
+    rows: list[aiosqlite.Row],
+) -> tuple[int, int, list[tuple[bytes32, bytes32, int, bytes | None, bool, bool, bytes, bytes]]]:
+    """Map one SQLite page to the last rowid, the highest height, and rows for import_block_rows."""
+    last_rowid = 0
+    highest = 0
+    pending: list[tuple[bytes32, bytes32, int, bytes | None, bool, bool, bytes, bytes]] = []
+    for row in rows:
+        last_rowid = int(row[0])
+        height = int(row[3])
+        highest = max(highest, height)
+        ses = row[4]
+        pending.append(
+            (
+                bytes32(row[1]),
+                bytes32(row[2]),
+                height,
+                None if ses is None else bytes(ses),
+                bool(row[5]),
+                bool(row[6]),
+                bytes(row[7]),
+                bytes(row[8]),
+            )
+        )
+    return last_rowid, highest, pending
 
 
 async def _meta(chain: ChainDB, key: bytes) -> bytes | None:

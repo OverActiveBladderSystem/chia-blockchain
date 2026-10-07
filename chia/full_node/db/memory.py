@@ -18,10 +18,14 @@ class MemoryBackend:
         family = self.data[cf]
         return {key: family[key] for key in keys if key in family}
 
-    async def scan(self, cf: str, start: bytes, end: bytes | None) -> list[tuple[bytes, bytes]]:
+    async def scan(
+        self, cf: str, start: bytes, end: bytes | None, *, limit: int | None = None
+    ) -> list[tuple[bytes, bytes]]:
         rows = [(key, value) for key, value in self.data[cf].items() if key_in_range(key, start, end)]
         rows.sort(key=lambda item: item[0])
-        return rows
+        if limit is None:
+            return rows
+        return rows[:limit]
 
     async def apply(self, ops: list[Op]) -> None:
         for op in ops:

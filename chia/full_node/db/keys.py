@@ -8,6 +8,7 @@ CF_COINS_BY_CONFIRMED = "coins_by_confirmed"
 CF_COINS_BY_SPENT = "coins_by_spent"
 CF_COINS_BY_PUZZLE_CONFIRMED = "coins_by_puzzle_confirmed"
 CF_COINS_BY_PUZZLE_SPENT = "coins_by_puzzle_spent"
+# Kept only so an older database can be told to drop this family on open.
 CF_COINS_BY_PARENT = "coins_by_parent"
 CF_COIN_DELTA = "coin_delta"
 CF_FF_UNSPENT = "ff_unspent"
@@ -28,7 +29,6 @@ COLUMN_FAMILIES: tuple[str, ...] = (
     CF_COINS_BY_SPENT,
     CF_COINS_BY_PUZZLE_CONFIRMED,
     CF_COINS_BY_PUZZLE_SPENT,
-    CF_COINS_BY_PARENT,
     CF_COIN_DELTA,
     CF_FF_UNSPENT,
     CF_BLOCK_BLOBS,
@@ -59,11 +59,21 @@ META_UNCOMPACT_COUNT = b"uncompact_count"
 META_HINT_COUNT = b"hint_count"
 META_MIGRATE_PHASE = b"migrate_phase"
 META_MIGRATE_ROWID = b"migrate_rowid"
+# Last full_blocks rowid copied before the chain index is built. Coin progress reuses migrate_rowid.
+META_MIGRATE_BLOCK_ROWID = b"migrate_block_rowid"
 META_MIGRATE_HEIGHT = b"migrate_height"
 META_MIGRATE_SOURCE = b"migrate_source"
+# Set after the chain snapshot has stored every main-chain sub-epoch summary.
+# Missing means step 8 must walk block records instead of this short list.
+META_SES_INDEX_READY = b"ses_index_ready"
+SES_INDEX_PREFIX = b"sesh"
 
 SQLITE_SUFFIX = ".sqlite"
 ROCKS_SUFFIX = ".rocksdb"
+
+
+def ses_index_key(height: int) -> bytes:
+    return SES_INDEX_PREFIX + u32_be(height)
 
 
 def u32_be(value: int) -> bytes:

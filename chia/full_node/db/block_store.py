@@ -29,14 +29,42 @@ from chia.full_node.db.keys import (
     META_MIGRATE_PHASE,
     META_PEAK,
     META_SCHEMA_VERSION,
+    META_SES_INDEX_READY,
     META_UNCOMPACT_COUNT,
+    SES_INDEX_PREFIX,
     prefix_end,
+    ses_index_key,
     u32_be,
     u32_from_be,
 )
 from chia.full_node.full_block_utils import GeneratorBlockInfo, block_info_from_block, generator_from_block
 from chia.util.errors import Err
 from chia.util.lru_cache import LRUCache
+
+
+def _put_ses_index(session: WriteSession, height: int, ses: bytes | None) -> None:
+    key = ses_index_key(height)
+    if ses:
+        session.put(CF_META, key, ses)
+    else:
+        session.delete(CF_META, key)
+
+
+async def _delete_ses_above(session: WriteSession, height: int) -> None:
+    """Drop sub-epoch index rows above `height` without a range tombstone.
+
+    DeleteRange stores a tombstone even when the range is empty. An extending
+    block rolls an empty range back on every block, and later reads of this
+    column family have to walk the whole pile until the memtable flushes.
+    """
+    ses_end = prefix_end(SES_INDEX_PREFIX)
+    if ses_end is None:
+        return
+    ses_start = ses_index_key(height + 1) if height >= 0 else SES_INDEX_PREFIX
+    rows = await session.scan(CF_META, ses_start, ses_end)
+    for key, _value in rows:
+        session.delete(CF_META, key)
+
 
 log = logging.getLogger(__name__)
 
@@ -124,13 +152,23 @@ class RocksBlockStore:
     async def import_block_rows(
         self,
         rows: list[tuple[bytes32, bytes32, int, bytes | None, bool, bool, bytes, bytes]],
+        *,
+        assume_new: bool = False,
+        record_chain: bool = True,
     ) -> None:
-        """Insert many copied blocks in one write. A block that is already stored is left as it is."""
+        """Insert many copied blocks in one write. A block that is already stored is left as it is.
+
+        The migration copy passes ``assume_new`` because it reads SQLite in rowid order and does not
+        revisit a finished batch. Looking those blocks up again walks every unmerged file.
+        That copy also passes ``record_chain`` false. The chain index is written afterward from SQLite.
+        """
         if len(rows) == 0:
             return
         async with self.db.writer_maybe_transaction() as session:
-            existing = await session.get_many(CF_BLOCK_META, [bytes(row[0]) for row in rows])
-            seen = set(existing)
+            seen: set[bytes] = set()
+            if not assume_new:
+                existing = await session.get_many(CF_BLOCK_META, [bytes(row[0]) for row in rows])
+                seen = set(existing)
             compact_delta = 0
             uncompact_delta = 0
             for header_hash, prev_hash, height, ses, compact, in_main_chain, block_blob, block_record in rows:
@@ -142,7 +180,7 @@ class RocksBlockStore:
                 session.put(CF_BLOCK_BLOBS, raw_hash, block_blob)
                 session.put(CF_BLOCK_META, raw_hash, encode_block_meta(meta))
                 session.put(CF_BLOCKS_AT_HEIGHT, u32_be(height) + raw_hash, b"")
-                if not in_main_chain:
+                if not record_chain or not in_main_chain:
                     continue
                 session.put(CF_MAIN_CHAIN, u32_be(height), raw_hash)
                 if compact:
@@ -162,6 +200,40 @@ class RocksBlockStore:
             session.delete_range(CF_UNCOMPACTIFIED, b"", b"\xff" * 8)
             session.put(CF_META, META_COMPACT_COUNT, (0).to_bytes(8, "little", signed=False))
             session.put(CF_META, META_UNCOMPACT_COUNT, (0).to_bytes(8, "little", signed=False))
+            ses_end = prefix_end(SES_INDEX_PREFIX)
+            if ses_end is not None:
+                session.delete_range(CF_META, SES_INDEX_PREFIX, ses_end)
+            session.delete(CF_META, META_SES_INDEX_READY)
+
+    async def apply_chain_snapshot(
+        self,
+        rows: list[tuple[bytes32, bytes32, int, bytes | None, bool, bool, bytes]],
+    ) -> None:
+        """Write chain membership from SQLite rows, without reading the copied blocks back.
+
+        Each row is ``(header_hash, prev_hash, height, sub_epoch_summary, compact, in_main_chain, block_record)``.
+        """
+        if len(rows) == 0:
+            return
+        async with self.db.writer_maybe_transaction() as session:
+            compact_delta = 0
+            uncompact_delta = 0
+            for header_hash, prev_hash, height, ses, compact, in_main_chain, block_record in rows:
+                meta = BlockMeta(prev_hash, height, compact, in_main_chain, ses, block_record)
+                session.put(CF_BLOCK_META, bytes(header_hash), encode_block_meta(meta))
+                if not in_main_chain:
+                    continue
+                session.put(CF_MAIN_CHAIN, u32_be(height), bytes(header_hash))
+                _put_ses_index(session, height, ses)
+                if compact:
+                    compact_delta += 1
+                else:
+                    session.put(CF_UNCOMPACTIFIED, u32_be(height), bytes(header_hash))
+                    uncompact_delta += 1
+            if compact_delta:
+                await self._add_count(session, META_COMPACT_COUNT, compact_delta)
+            if uncompact_delta:
+                await self._add_count(session, META_UNCOMPACT_COUNT, uncompact_delta)
 
     async def apply_membership(self, membership: list[tuple[bytes32, bool, bool]]) -> None:
         """Record one batch of (hash, in_chain, compact) from a chain snapshot."""
@@ -205,6 +277,34 @@ class RocksBlockStore:
             return None
         return bytes32(raw)
 
+    async def main_chain_window(self, start: int, stop_inclusive: int) -> list[tuple[int, bytes32]]:
+        async with self.db.reader_no_transaction() as view:
+            return await self._main_chain_between(view, start, stop_inclusive)
+
+    async def mark_ses_index_ready(self) -> None:
+        async with self.db.writer_maybe_transaction() as session:
+            session.put(CF_META, META_SES_INDEX_READY, b"1")
+
+    async def ses_index_ready(self) -> bool:
+        async with self.db.reader_no_transaction() as view:
+            return await view.get(CF_META, META_SES_INDEX_READY) == b"1"
+
+    async def note_main_chain_ses(self, height: int, ses: bytes | None) -> None:
+        async with self.db.writer_maybe_transaction() as session:
+            _put_ses_index(session, height, ses)
+
+    async def stored_sub_epoch_summaries(self) -> dict[int, bytes]:
+        end = prefix_end(SES_INDEX_PREFIX)
+        async with self.db.reader_no_transaction() as view:
+            rows = await view.scan(CF_META, SES_INDEX_PREFIX, end)
+        prefix_len = len(SES_INDEX_PREFIX)
+        summaries: dict[int, bytes] = {}
+        for key, value in rows:
+            if len(key) != prefix_len + 4:
+                continue
+            summaries[u32_from_be(key[prefix_len:])] = value
+        return summaries
+
     async def peak_height_map_row(self) -> tuple[bytes32, bytes32, uint32, bytes | None] | None:
         async with self.db.reader_no_transaction() as view:
             raw = await view.get(CF_META, META_PEAK)
@@ -246,6 +346,10 @@ class RocksBlockStore:
             rows = await session.scan(CF_MAIN_CHAIN, start, None)
             for key, value in rows:
                 await self._clear_main_chain(session, u32_from_be(key), bytes32(value))
+            # An extending block finds no main-chain row above the fork. Scanning
+            # meta anyway walks every old range deletion still stored there.
+            if rows:
+                await _delete_ses_above(session, height)
 
     async def set_in_chain(self, header_hashes: list[tuple[bytes32]]) -> None:
         async with self.db.writer_maybe_transaction() as session:

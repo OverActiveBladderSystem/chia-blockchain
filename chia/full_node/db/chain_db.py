@@ -55,8 +55,13 @@ class _View:
                 present[key] = fetched[key]
         return present
 
-    async def scan(self, cf: str, start: bytes, end: bytes | None) -> list[tuple[bytes, bytes]]:
-        rows = dict(await self._backend.scan(cf, start, end))
+    async def scan(
+        self, cf: str, start: bytes, end: bytes | None, *, limit: int | None = None
+    ) -> list[tuple[bytes, bytes]]:
+        # Uncommitted puts can land anywhere in the range, so a capped read could
+        # skip a key this session just wrote. Read the whole range, then trim.
+        pending = any(op.cf == cf for op in self._ops)
+        rows = dict(await self._backend.scan(cf, start, end, limit=None if pending else limit))
         for op in self._ops:
             if op.cf != cf:
                 continue
@@ -77,7 +82,10 @@ class _View:
                 if lo < hi:
                     for key in [key for key in rows if key_in_range(key, lo, hi)]:
                         del rows[key]
-        return sorted(rows.items(), key=lambda item: item[0])
+        ordered = sorted(rows.items(), key=lambda item: item[0])
+        if limit is not None:
+            return ordered[:limit]
+        return ordered
 
 
 class WriteSession(_View):
@@ -140,12 +148,36 @@ class ChainDB:
         async with self._lock:
             await write(groups, disable_wal=disable_wal)
 
+    def directory(self) -> Path:
+        directory = getattr(self._backend, "directory", None)
+        if directory is None:
+            raise RuntimeError("this database has no folder to pack")
+        return directory()
+
+    async def stored_family_bytes(self, names: list[str]) -> dict[str, int]:
+        read = getattr(self._backend, "stored_family_bytes", None)
+        if read is None:
+            return {name: 1 for name in names}
+        async with self._lock:
+            return await read(names)
+
     async def merge_families(self, names: list[str]) -> None:
         merge = getattr(self._backend, "merge_families", None)
         if merge is None:
             raise RuntimeError("this database cannot merge its stored files")
         async with self._lock:
             await merge(names)
+
+    def pause_file_chip(self, paused: bool) -> None:
+        pause = getattr(self._backend, "pause_file_chip", None)
+        if pause is not None:
+            pause(paused)
+
+    def request_file_chip(self, *, long_sync: bool, save_waiting: bool, last_save_slow: bool) -> None:
+        """Ask for one small pack. Does not wait, and does not hold the database lock."""
+        request = getattr(self._backend, "request_file_chip", None)
+        if request is not None:
+            request(long_sync=long_sync, save_waiting=save_waiting, last_save_slow=last_save_slow)
 
     @asynccontextmanager
     async def writer(self) -> AsyncIterator[WriteSession]:

@@ -8,7 +8,6 @@ from chia_rs.sized_ints import uint64
 from chia.full_node.db.keys import (
     CF_COINS,
     CF_COINS_BY_CONFIRMED,
-    CF_COINS_BY_PARENT,
     CF_COINS_BY_PUZZLE_CONFIRMED,
     CF_COINS_BY_PUZZLE_SPENT,
     CF_COINS_BY_SPENT,
@@ -67,7 +66,6 @@ def index_entries(record: StoredCoin) -> list[tuple[str, bytes]]:
         (CF_COINS, name),
         (CF_COINS_BY_CONFIRMED, confirmed + name),
         (CF_COINS_BY_PUZZLE_CONFIRMED, bytes(record.puzzle_hash) + confirmed + name),
-        (CF_COINS_BY_PARENT, bytes(record.parent) + confirmed + name),
     ]
     if record.spent_index > 0:
         spent = u32_be(record.spent_index)
@@ -84,7 +82,6 @@ def lookup_entries(record: StoredCoin) -> list[tuple[str, bytes]]:
     confirmed = u32_be(record.confirmed_index)
     entries = [
         (CF_COINS_BY_PUZZLE_CONFIRMED, bytes(record.puzzle_hash) + confirmed + name),
-        (CF_COINS_BY_PARENT, bytes(record.parent) + confirmed + name),
     ]
     if record.spent_index > 0:
         spent = u32_be(record.spent_index)
@@ -109,30 +106,75 @@ def encode_delta(added: list[StoredCoin], removed: list[tuple[bytes32, int]]) ->
     return b"".join(parts)
 
 
-def decode_delta(raw: bytes) -> tuple[list[StoredCoin], list[tuple[bytes32, int]]]:
+_NAME_LEN = 32
+_REMOVAL_LEN = _NAME_LEN + 8
+_ADDED_STRIDE = _NAME_LEN + _RECORD_LEN
+# Offsets inside encode_coin's record. Height is little-endian there.
+_SPENT_OFF = 4
+_SPENT_END = 12
+_PUZZLE_OFF = 13
+_PUZZLE_END = 45
+
+
+def _delta_layout(raw: bytes) -> tuple[int, int]:
+    """Return (added_end, removed_count) for a CD1 journal."""
     if len(raw) < 7 or raw[:3] != _DELTA_MAGIC:
         raise ValueError("coin journal is not a CD1 record")
     added_count = int.from_bytes(raw[3:7], "big", signed=False)
-    cursor = 7
-    added: list[StoredCoin] = []
-    record_len = 32 + _RECORD_LEN
-    added_end = cursor + added_count * record_len
+    added_end = 7 + added_count * _ADDED_STRIDE
     if added_end + 4 > len(raw):
         raise ValueError("coin journal additions are truncated")
+    removed_count = int.from_bytes(raw[added_end : added_end + 4], "big", signed=False)
+    if added_end + 4 + removed_count * _REMOVAL_LEN != len(raw):
+        raise ValueError("coin journal removals are truncated")
+    return added_end, removed_count
+
+
+def added_lookup_keys(raw: bytes) -> tuple[int, list[tuple[str, bytes]]]:
+    """Wallet lookup keys for coins added in a journal.
+
+    The journal already stores each coin record. Reading those bytes avoids building a
+    StoredCoin per coin. The record keeps height little-endian; lookup keys use big-endian.
+    """
+    added_end, _removed_count = _delta_layout(raw)
+    keys: list[tuple[str, bytes]] = []
+    cursor = 7
     while cursor < added_end:
-        name = bytes32(raw[cursor : cursor + 32])
-        cursor += 32
+        name = raw[cursor : cursor + _NAME_LEN]
+        record = cursor + _NAME_LEN
+        confirmed = raw[record : record + 4][::-1]
+        puzzle = raw[record + _PUZZLE_OFF : record + _PUZZLE_END]
+        keys.append((CF_COINS_BY_PUZZLE_CONFIRMED, puzzle + confirmed + name))
+        spent = int.from_bytes(raw[record + _SPENT_OFF : record + _SPENT_END], "little", signed=True)
+        if spent > 0:
+            keys.append((CF_COINS_BY_PUZZLE_SPENT, puzzle + u32_be(spent) + name))
+        elif spent == -1:
+            keys.append((CF_FF_UNSPENT, puzzle + name))
+        cursor += _ADDED_STRIDE
+    return (added_end - 7) // _ADDED_STRIDE, keys
+
+
+def delta_removals(raw: bytes) -> list[tuple[bytes32, int]]:
+    """Names and previous spent heights for coins spent in a journal."""
+    added_end, removed_count = _delta_layout(raw)
+    cursor = added_end + 4
+    end = cursor + removed_count * _REMOVAL_LEN
+    removed: list[tuple[bytes32, int]] = []
+    while cursor < end:
+        name = bytes32(raw[cursor : cursor + _NAME_LEN])
+        previous = int.from_bytes(raw[cursor + _NAME_LEN : cursor + _REMOVAL_LEN], "big", signed=True)
+        removed.append((name, previous))
+        cursor += _REMOVAL_LEN
+    return removed
+
+
+def decode_delta(raw: bytes) -> tuple[list[StoredCoin], list[tuple[bytes32, int]]]:
+    added_end, _removed_count = _delta_layout(raw)
+    cursor = 7
+    added: list[StoredCoin] = []
+    while cursor < added_end:
+        name = bytes32(raw[cursor : cursor + _NAME_LEN])
+        cursor += _NAME_LEN
         added.append(decode_coin(name, raw[cursor : cursor + _RECORD_LEN]))
         cursor += _RECORD_LEN
-    removed_count = int.from_bytes(raw[cursor : cursor + 4], "big", signed=False)
-    cursor += 4
-    removed_end = cursor + removed_count * 40
-    if removed_end != len(raw):
-        raise ValueError("coin journal removals are truncated")
-    removed: list[tuple[bytes32, int]] = []
-    while cursor < removed_end:
-        name = bytes32(raw[cursor : cursor + 32])
-        previous = int.from_bytes(raw[cursor + 32 : cursor + 40], "big", signed=True)
-        removed.append((name, previous))
-        cursor += 40
-    return added, removed
+    return added, delta_removals(raw)

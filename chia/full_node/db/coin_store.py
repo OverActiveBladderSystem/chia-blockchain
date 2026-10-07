@@ -11,8 +11,10 @@ from chia_rs.sized_ints import uint32, uint64
 from chia.full_node.db.chain_db import ChainDB, WriteSession, _View
 from chia.full_node.db.coin_codec import (
     StoredCoin,
+    added_lookup_keys,
     decode_coin,
     decode_delta,
+    delta_removals,
     encode_coin,
     encode_delta,
     index_entries,
@@ -22,7 +24,6 @@ from chia.full_node.db.keys import (
     CF_COIN_DELTA,
     CF_COINS,
     CF_COINS_BY_CONFIRMED,
-    CF_COINS_BY_PARENT,
     CF_COINS_BY_PUZZLE_CONFIRMED,
     CF_COINS_BY_PUZZLE_SPENT,
     CF_COINS_BY_SPENT,
@@ -39,6 +40,10 @@ from chia.types.blockchain_format.coin import Coin
 from chia.types.mempool_item import UnspentLineageInfo
 
 log = logging.getLogger(__name__)
+
+# One long-sync batch is at most 32 blocks, and each block journals at most one row.
+# Indexing that many releases the chain writer before the next batch needs it.
+COIN_INDEX_CHUNK = 32
 
 
 class RocksCoinStore:
@@ -65,7 +70,6 @@ class RocksCoinStore:
         by_spent: list[tuple[bytes, bytes]] = []
         by_puzzle_confirmed: list[tuple[bytes, bytes]] = []
         by_puzzle_spent: list[tuple[bytes, bytes]] = []
-        by_parent: list[tuple[bytes, bytes]] = []
         fast_forward: list[tuple[bytes, bytes]] = []
         unspent_delta = 0
         empty = b""
@@ -90,7 +94,6 @@ class RocksCoinStore:
             coins.append((name, value))
             by_confirmed.append((confirmed + name, empty))
             by_puzzle_confirmed.append((puzzle_hash + confirmed + name, empty))
-            by_parent.append((parent + confirmed + name, empty))
             if spent_index > 0:
                 spent = u32_be(spent_index)
                 by_spent.append((spent + name, empty))
@@ -104,7 +107,6 @@ class RocksCoinStore:
         by_spent.sort()
         by_puzzle_confirmed.sort()
         by_puzzle_spent.sort()
-        by_parent.sort()
         fast_forward.sort()
         await self.db.write_column_batches(
             [
@@ -113,7 +115,6 @@ class RocksCoinStore:
                 (CF_COINS_BY_SPENT, by_spent),
                 (CF_COINS_BY_PUZZLE_CONFIRMED, by_puzzle_confirmed),
                 (CF_COINS_BY_PUZZLE_SPENT, by_puzzle_spent),
-                (CF_COINS_BY_PARENT, by_parent),
                 (CF_FF_UNSPENT, fast_forward),
             ],
             disable_wal=True,
@@ -163,7 +164,6 @@ class RocksCoinStore:
                 CF_COINS_BY_SPENT,
                 CF_COINS_BY_PUZZLE_CONFIRMED,
                 CF_COINS_BY_PUZZLE_SPENT,
-                CF_COINS_BY_PARENT,
                 CF_COIN_DELTA,
                 CF_FF_UNSPENT,
             ):
@@ -311,6 +311,17 @@ class RocksCoinStore:
             return None
         return decode_coin(coin_name, raw)
 
+    async def _load_many(self, view: _View, names: list[bytes32]) -> dict[bytes32, StoredCoin]:
+        if len(names) == 0:
+            return {}
+        found = await view.get_many(CF_COINS, [bytes(name) for name in names])
+        loaded: dict[bytes32, StoredCoin] = {}
+        for name in names:
+            raw = found.get(bytes(name))
+            if raw is not None:
+                loaded[name] = decode_coin(name, raw)
+        return loaded
+
     async def _drop_indexes(self, session: WriteSession, record: StoredCoin) -> None:
         for cf, key in index_entries(record):
             if cf == CF_COINS:
@@ -350,49 +361,73 @@ class RocksCoinStore:
         for family, key in lookup_entries(record):
             session.delete(family, key)
 
-    async def index_pending(self) -> None:
-        """Write puzzle, parent, and fast-forward lookup keys for journals not indexed yet.
+    async def index_pending(self, *, limit: int | None = None) -> bool:
+        """Write puzzle, parent, and fast-forward lookup keys for one chunk of journals.
 
         The block commit already stored the coin records. This second write is what wallet
-        peers search. It runs after the peak is announced so it is not part of db-write.
+        peers search. One call commits at most one chunk and releases the chain writer.
+        Returns True when journals are still waiting.
         """
+        chunk = COIN_INDEX_CHUNK if limit is None else limit
+        if chunk <= 0:
+            raise ValueError(f"coin index chunk must be positive, got {chunk}")
         started = time.monotonic()
+        more = False
+        added_count = 0
+        last = 0
         async with self.db.writer() as session:
             raw = await session.get(CF_META, META_COIN_INDEXED)
             if raw is None:
-                return
+                return False
             indexed = int.from_bytes(raw, "big", signed=True)
             start = b"\x00\x00\x00\x00" if indexed < 0 else u32_be(indexed + 1)
-            rows = await session.scan(CF_COIN_DELTA, start, None)
+            # One extra row tells us whether another journal follows, without reading the tail.
+            rows = await session.scan(CF_COIN_DELTA, start, None, limit=chunk + 1)
             if len(rows) == 0:
-                return
-            added_count = 0
+                return False
+            more = len(rows) > chunk
+            if more:
+                rows = rows[:chunk]
+            # Load every spend in one read before queuing lookup keys. A coin read scans
+            # every key already queued in this session, and those keys are not coin records.
+            # Fast-forward deletes are applied after the new keys so a coin created and
+            # spent inside this batch still drops its unspent key.
+            removals: list[tuple[bytes32, int]] = []
+            for _key, value in rows:
+                removals.extend(delta_removals(value))
+            removal_names = [bytes(name) for name, _previous in removals]
+            raw_by_name = await session.get_many(CF_COINS, removal_names) if removal_names else {}
+            spent_records = [(name, previous, raw_by_name.get(bytes(name))) for name, previous in removals]
             last = indexed
             for key, value in rows:
-                added, removed = decode_delta(value)
-                await self._index_journal(session, added, removed)
-                added_count += len(added)
+                added_here, lookup_keys = added_lookup_keys(value)
+                for family, lookup_key in lookup_keys:
+                    session.put(family, lookup_key, b"")
+                added_count += added_here
                 last = u32_from_be(key)
+            self._apply_removal_lookups(session, spent_records)
             session.put(CF_META, META_COIN_INDEXED, int(last).to_bytes(4, "big", signed=True))
-            elapsed = time.monotonic() - started
-            if elapsed >= 0.2 or added_count >= 1000:
-                log.info(
-                    "coin lookups indexed through height %s in %.2fs (%s coins)",
-                    last,
-                    elapsed,
-                    added_count,
-                )
+        elapsed = time.monotonic() - started
+        if more or elapsed >= 0.2 or added_count >= 1000:
+            log.info(
+                "coin lookups indexed through height %s in %.2fs (%s coins)",
+                last,
+                elapsed,
+                added_count,
+            )
+        return more
 
-    async def _index_journal(
+    async def index_pending_all(self) -> None:
+        """Index every waiting journal, releasing the chain writer between chunks."""
+        while await self.index_pending():
+            pass
+
+    def _apply_removal_lookups(
         self,
         session: WriteSession,
-        added: list[StoredCoin],
-        removed: list[tuple[bytes32, int]],
+        spent_records: list[tuple[bytes32, int, bytes | None]],
     ) -> None:
-        for record in added:
-            self._put_lookup(session, record)
-        for name, previous in removed:
-            raw = await session.get(CF_COINS, bytes(name))
+        for name, previous, raw in spent_records:
             if raw is None:
                 continue
             current = decode_coin(name, raw)
@@ -468,26 +503,31 @@ class RocksCoinStore:
         return found
 
     async def get_coin_records(self, names: Collection[bytes32]) -> list[CoinRecord]:
-        records: list[CoinRecord] = []
+        # One read for the whole request. Keep the asked-for order, repeat a name
+        # that was asked for twice, and leave out a name that is not stored.
+        ordered = list(names)
+        if len(ordered) == 0:
+            return []
         async with self.db.reader_no_transaction() as view:
-            for name in names:
-                raw = await view.get(CF_COINS, bytes(name))
-                if raw is not None:
-                    records.append(_to_record(decode_coin(name, raw)))
-        return records
+            loaded = await self._load_many(view, ordered)
+        return [_to_record(loaded[name]) for name in ordered if name in loaded]
 
     async def get_coins_added_at_height(self, height: uint32) -> list[CoinRecord]:
         async with self.db.reader_no_transaction() as view:
-            raw = await view.get(CF_COIN_DELTA, u32_be(int(height)))
-            if raw is not None:
-                added, _removed = decode_delta(raw)
-                records: list[CoinRecord] = []
-                for created in added:
-                    current = await view.get(CF_COINS, bytes(created.coin_name))
-                    if current is not None:
-                        records.append(_to_record(decode_coin(created.coin_name, current)))
-                return records
-        return await self._records_by_height_index(CF_COINS_BY_CONFIRMED, int(height))
+            stored = await self._stored_coins_added_at_height(view, int(height))
+        return [_to_record(record) for record in stored]
+
+    async def _stored_coins_added_at_height(self, view: _View, height: int) -> list[StoredCoin]:
+        raw = await view.get(CF_COIN_DELTA, u32_be(height))
+        if raw is not None:
+            added, _removed = decode_delta(raw)
+            loaded = await self._load_many(view, [created.coin_name for created in added])
+            return [loaded[created.coin_name] for created in added if created.coin_name in loaded]
+        prefix = u32_be(height)
+        rows = await view.scan(CF_COINS_BY_CONFIRMED, prefix, prefix_end(prefix))
+        names = [bytes32(key[-32:]) for key, _value in rows]
+        loaded = await self._load_many(view, names)
+        return [loaded[name] for name in names if name in loaded]
 
     async def get_coins_removed_at_height(self, height: uint32) -> list[CoinRecord]:
         if height == 0:
@@ -496,12 +536,8 @@ class RocksCoinStore:
             raw = await view.get(CF_COIN_DELTA, u32_be(int(height)))
             if raw is not None:
                 _added, removed = decode_delta(raw)
-                records: list[CoinRecord] = []
-                for name, _previous in removed:
-                    current = await view.get(CF_COINS, bytes(name))
-                    if current is not None:
-                        records.append(_to_record(decode_coin(name, current)))
-                return records
+                loaded = await self._load_many(view, [name for name, _previous in removed])
+                return [_to_record(loaded[name]) for name, _previous in removed if name in loaded]
         return await self._records_by_height_index(CF_COINS_BY_SPENT, int(height))
 
     async def _records_by_height_index(self, cf: str, height: int) -> list[CoinRecord]:
@@ -509,25 +545,28 @@ class RocksCoinStore:
         end = prefix_end(prefix)
         async with self.db.reader_no_transaction() as view:
             rows = await view.scan(cf, prefix, end)
-            records: list[CoinRecord] = []
-            for key, _value in rows:
-                name = bytes32(key[-32:])
-                raw = await view.get(CF_COINS, bytes(name))
-                if raw is None:
-                    continue
-                records.append(_to_record(decode_coin(name, raw)))
-        return records
+            names = [bytes32(key[-32:]) for key, _value in rows]
+            loaded = await self._load_many(view, names)
+        return [_to_record(loaded[name]) for name in names if name in loaded]
 
     async def rollback_to_block(self, block_index: int) -> dict[bytes32, CoinRecord]:
         changes: dict[bytes32, CoinRecord] = {}
         async with self.db.writer_maybe_transaction() as session:
             handled: set[bytes32] = set()
+            # Restored records stay in memory so undoing the block that created
+            # them does not read each coin back from the table.
+            restored_records: dict[bytes32, StoredCoin] = {}
+            unspent_delta = 0
             start = b"\x00\x00\x00\x00" if block_index < 0 else u32_be(block_index + 1)
             journals = await session.scan(CF_COIN_DELTA, start, None)
             for key, value in reversed(journals):
                 added_records, removed = decode_delta(value)
+                missing = [name for name, _previous in removed if name not in restored_records and name not in handled]
+                loaded = await self._load_many(session, missing)
                 for name, previous in removed:
-                    record = await self._load(session, name)
+                    record = restored_records.get(name)
+                    if record is None:
+                        record = loaded.get(name)
                     if record is None or name in handled:
                         continue
                     self._drop_lookup(session, record)
@@ -544,7 +583,8 @@ class RocksCoinStore:
                     session.put(CF_COINS, bytes(name), encode_coin(restored))
                     self._put_lookup(session, restored)
                     if record.spent_index > 0 and previous <= 0:
-                        await self._add_unspent(session, 1)
+                        unspent_delta += 1
+                    restored_records[name] = restored
                     changes[name] = CoinRecord(
                         record.coin(),
                         uint32(record.confirmed_index),
@@ -553,10 +593,11 @@ class RocksCoinStore:
                         uint64(record.timestamp),
                     )
                 for created in added_records:
-                    record = await self._load(session, created.coin_name)
-                    if record is None:
-                        continue
-                    await self._delete_record(session, record)
+                    record = restored_records.pop(created.coin_name, created)
+                    self._drop_lookup(session, record)
+                    session.delete(CF_COINS, bytes(created.coin_name))
+                    if record.spent_index <= 0:
+                        unspent_delta -= 1
                     handled.add(created.coin_name)
                     changes[created.coin_name] = CoinRecord(
                         record.coin(),
@@ -566,6 +607,8 @@ class RocksCoinStore:
                         uint64(0),
                     )
                 session.delete(CF_COIN_DELTA, key)
+            if unspent_delta != 0:
+                await self._add_unspent(session, unspent_delta)
             indexed_raw = await session.get(CF_META, META_COIN_INDEXED)
             if indexed_raw is not None:
                 indexed = int.from_bytes(indexed_raw, "big", signed=True)
@@ -644,9 +687,7 @@ class RocksCoinStore:
         if record.spent_index <= 0:
             await self._add_unspent(session, -1)
 
-    async def _pending_journals(
-        self, view: _View
-    ) -> list[tuple[list[StoredCoin], list[tuple[bytes32, int]]]]:
+    async def _pending_journals(self, view: _View) -> list[tuple[list[StoredCoin], list[tuple[bytes32, int]]]]:
         raw = await view.get(CF_META, META_COIN_INDEXED)
         if raw is None:
             return []
@@ -751,30 +792,25 @@ class RocksCoinStore:
     ) -> list[CoinRecord]:
         if max_items <= 0 or len(parent_ids) == 0:
             return []
+        # A child is created in the block that spends its parent. The parent record
+        # has that height, and the coins added there already carry the parent id.
         found: list[CoinRecord] = []
         seen: set[bytes32] = set()
+        added_at: dict[int, list[StoredCoin]] = {}
         async with self.db.reader_no_transaction() as view:
-            journals = await self._pending_journals(view)
             for parent_id in parent_ids:
-                start = bytes(parent_id) + u32_be(int(start_height))
-                end = bytes(parent_id) + u32_be(int(end_height))
-                rows = await view.scan(CF_COINS_BY_PARENT, start, end)
-                for key, _value in rows:
-                    name = bytes32(key[-32:])
-                    if name in seen:
-                        continue
-                    raw = await view.get(CF_COINS, bytes(name))
-                    if raw is None:
-                        continue
-                    stored = decode_coin(name, raw)
-                    if not include_spent_coins and stored.spent_index > 0:
-                        continue
-                    seen.add(name)
-                    found.append(_to_record(stored))
-                    if len(found) >= max_items:
-                        return found
-                pending = await self._pending_coins(view, journals, parent=parent_id)
-                for stored in pending:
+                raw = await view.get(CF_COINS, bytes(parent_id))
+                if raw is None:
+                    continue
+                parent = decode_coin(parent_id, raw)
+                if parent.spent_index <= 0:
+                    continue
+                height = parent.spent_index
+                if height not in added_at:
+                    added_at[height] = await self._stored_coins_added_at_height(view, height)
+                matches = [stored for stored in added_at[height] if stored.parent == parent_id]
+                matches.sort(key=lambda stored: (stored.confirmed_index, bytes(stored.coin_name)))
+                for stored in matches:
                     if stored.coin_name in seen:
                         continue
                     if stored.confirmed_index < int(start_height) or stored.confirmed_index >= int(end_height):
@@ -873,9 +909,7 @@ class RocksCoinStore:
                 stored = decode_coin(coin_id, raw)
                 if stored.confirmed_index < int(min_height) and stored.spent_index < int(min_height):
                     continue
-                if limit_height and (
-                    stored.confirmed_index > int(max_height) or stored.spent_index > int(max_height)
-                ):
+                if limit_height and (stored.confirmed_index > int(max_height) or stored.spent_index > int(max_height)):
                     continue
                 if not include_spent_coins and stored.spent_index > 0:
                     continue
