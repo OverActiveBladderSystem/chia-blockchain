@@ -10,6 +10,22 @@ from chia.types.blockchain_format import vdf
 from chia.types.blockchain_format.classgroup import ClassgroupElement
 
 
+def test_discriminant_cache_keeps_the_nearest_blocks_proved_ahead(monkeypatch: pytest.MonkeyPatch) -> None:
+    # 1024 dropped an early challenge once the waiting line passed it. The first
+    # challenges are the blocks whose turn comes first.
+    monkeypatch.setattr(vdf, "create_discriminant", lambda _challenge, _size: "1")
+    vdf._discriminant_ready.clear()
+    vdf._discriminant_inflight.clear()
+    try:
+        for i in range(2000):
+            vdf.get_discriminant(bytes32(i.to_bytes(32, "big")), 1024)
+        assert len(vdf._discriminant_ready) == 2000
+        assert (bytes(bytes32.zeros), 1024) in vdf._discriminant_ready
+    finally:
+        vdf._discriminant_ready.clear()
+        vdf._discriminant_inflight.clear()
+
+
 @pytest.mark.parametrize(
     ("witness_type", "witness_size"),
     [
