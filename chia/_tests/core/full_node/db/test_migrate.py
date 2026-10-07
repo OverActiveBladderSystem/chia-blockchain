@@ -66,6 +66,56 @@ def test_progress_line_stays_narrower_than_the_terminal() -> None:
     assert short.endswith(" ")
 
 
+def test_pack_progress_rates_bytes_and_keeps_partial_credit() -> None:
+    assert migrate_module._pack_credit(0, 500, 1000) == 500
+    assert migrate_module._pack_credit(500, 100, 1000) == 500
+    assert migrate_module._pack_credit(500, 2000, 1000) == 950
+    progress = migrate_module.MigrateProgress(
+        "pack",
+        10,
+        100,
+        "packing block files, 1.0 GB written, 4 files on disk",
+        work_done=10 * 1024 * 1024,
+        work_total=100 * 1024 * 1024,
+    )
+    line = migrate_module.format_progress(
+        progress,
+        elapsed_seconds=10,
+        done_this_run=10 * 1024 * 1024,
+        rate_seconds=10,
+    )
+    assert "1 MB/s" in line
+    assert "ETA" in line
+
+
+@pytest.mark.anyio
+async def test_pack_updates_while_a_group_is_still_packing(tmp_path: Path) -> None:
+    (tmp_path / "start.sst").write_bytes(b"a" * 100)
+    seen: list[migrate_module.MigrateProgress] = []
+
+    class _Pack:
+        def directory(self) -> Path:
+            return tmp_path
+
+        async def stored_family_bytes(self, names: list[str]) -> dict[str, int]:
+            return {name: 5 * 1024 * 1024 for name in names}
+
+        async def merge_families(self, names: list[str]) -> None:
+            await asyncio.sleep(0.05)
+            (tmp_path / "more.sst").write_bytes(b"b" * (2 * 1024 * 1024))
+            await asyncio.sleep(0.2)
+
+    await migrate_module._merge_stored_files(
+        _Pack(),  # type: ignore[arg-type]
+        seen.append,
+        None,
+        families=(("block_blobs", "block files"),),
+        poll_seconds=0.05,
+    )
+    assert seen[-1].detail == "packed the database files"
+    assert any("2 MB written" in item.detail and "2 files on disk" in item.detail for item in seen)
+
+
 def test_progress_line_shows_height_rate_and_eta() -> None:
     progress = migrate_module.MigrateProgress(
         "blocks",
@@ -240,6 +290,83 @@ async def test_block_copy_progress_reports_chain_height(tmp_path: Path) -> None:
     assert blocks[-1].target == 1
     assert blocks[-1].detail == "rows 2 / 2"
     assert "1 / 1" in migrate_module.format_progress(blocks[-1])
+
+
+@pytest.mark.anyio
+async def test_startup_files_are_created_from_the_chain_index_when_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sqlite_path = tmp_path / "chain.sqlite"
+    peak, _unspent = _write_sqlite(sqlite_path)
+    ses = b"summary-at-1"
+    later = b"summary-at-2"
+    new_peak = bytes32(b"\x09" * 32)
+    with sqlite3.connect(sqlite_path) as db:
+        db.execute("UPDATE full_blocks SET sub_epoch_summary=? WHERE header_hash=?", (ses, peak))
+        db.commit()
+
+    async def add_block_before_follow() -> None:
+        with sqlite3.connect(sqlite_path) as db:
+            db.execute(
+                "INSERT INTO full_blocks VALUES (?,?,?,?,?,?,?,?)",
+                (new_peak, peak, 2, later, 0, 1, b"block-2", b"record-2"),
+            )
+            db.execute("UPDATE current_peak SET hash=? WHERE key=0", (new_peak,))
+            db.commit()
+
+    def fail_walk(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("startup files walked every block record")
+
+    monkeypatch.setattr(BlockHeightMap, "create_for_rocks", fail_walk)
+    output = tmp_path / "out"
+    await migrate_database(
+        sqlite_path,
+        output,
+        selected_network="mainnet",
+        constants=DEFAULT_CONSTANTS,
+        assume_source_headroom=True,
+        before_follow=add_block_before_follow,
+    )
+    from chia.consensus.block_height_map import SesCache
+
+    assert (output / "height-to-hash").read_bytes() == bytes(b"\x01" * 32) + bytes(peak) + bytes(new_peak)
+    loaded = SesCache.from_bytes((output / "sub-epoch-summaries").read_bytes()).content
+    assert {int(height): bytes(summary) for height, summary in loaded} == {1: ses, 2: later}
+
+
+@pytest.mark.anyio
+async def test_missing_summary_index_still_writes_startup_files(tmp_path: Path) -> None:
+    sqlite_path = tmp_path / "chain.sqlite"
+    peak, _unspent = _write_sqlite(sqlite_path)
+    ses = b"summary-at-1"
+    with sqlite3.connect(sqlite_path) as db:
+        db.execute("UPDATE full_blocks SET sub_epoch_summary=? WHERE header_hash=?", (ses, peak))
+        db.commit()
+    output = tmp_path / "out"
+    rocks_path = await migrate_database(
+        sqlite_path,
+        output,
+        selected_network="mainnet",
+        constants=DEFAULT_CONSTANTS,
+        assume_source_headroom=True,
+    )
+    from chia.consensus.block_height_map import SesCache
+    from chia.full_node.db.block_store import RocksBlockStore
+    from chia.full_node.db.keys import CF_META, META_SES_INDEX_READY
+
+    (output / "height-to-hash").unlink()
+    (output / "sub-epoch-summaries").unlink()
+    chain = ChainDB(RocksBackend(rocks_path, sync="OFF"))
+    try:
+        async with chain.writer() as session:
+            session.delete(CF_META, META_SES_INDEX_READY)
+        blocks = await RocksBlockStore.create(chain, use_cache=False)
+        await migrate_module._write_startup_cache(output, blocks, "mainnet", None, None)
+    finally:
+        await chain.close()
+    assert (output / "height-to-hash").read_bytes() == bytes(b"\x01" * 32) + bytes(peak)
+    loaded = SesCache.from_bytes((output / "sub-epoch-summaries").read_bytes()).content
+    assert {int(height): bytes(summary) for height, summary in loaded} == {1: ses}
 
 
 @pytest.mark.anyio
@@ -450,6 +577,85 @@ async def test_follow_picks_up_a_block_added_during_the_copy(tmp_path: Path) -> 
         from chia.cmds.db_backup_func import backup_db
 
         backup_db(rocks_path, tmp_path / "ignored.rocksdb", no_indexes=True)
+
+
+@pytest.mark.anyio
+async def test_chain_step_stores_a_block_that_arrived_after_the_block_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sqlite_path = tmp_path / "chain.sqlite"
+    peak, _unspent = _write_sqlite(sqlite_path)
+    new_peak = bytes32(b"\x09" * 32)
+    real_snapshot = migrate_module._copy_snapshot
+
+    async def insert_then_snapshot(*args: object, **kwargs: object) -> None:
+        with sqlite3.connect(sqlite_path) as db:
+            db.execute("UPDATE full_blocks SET is_fully_compactified=1 WHERE header_hash=?", (peak,))
+            db.execute(
+                "INSERT INTO full_blocks VALUES (?,?,?,?,?,?,?,?)",
+                (new_peak, peak, 2, None, 0, 1, b"block-2", b"record-2"),
+            )
+            db.execute("UPDATE current_peak SET hash=? WHERE key=0", (new_peak,))
+            db.commit()
+        await real_snapshot(*args, **kwargs)
+
+    monkeypatch.setattr(migrate_module, "_copy_snapshot", insert_then_snapshot)
+    rocks_path = await migrate_database(
+        sqlite_path,
+        tmp_path / "out",
+        selected_network="mainnet",
+        constants=DEFAULT_CONSTANTS,
+        assume_source_headroom=True,
+    )
+    from chia.full_node.db.block_store import RocksBlockStore
+    from chia.full_node.db.keys import CF_BLOCK_BLOBS
+
+    chain = ChainDB(RocksBackend(rocks_path, sync="OFF"))
+    try:
+        blocks = await RocksBlockStore.create(chain, use_cache=False)
+        coins = await RocksCoinStore.create(chain)
+        assert await blocks.get_peak() == (new_peak, 2)
+        assert await blocks.main_chain_hash_at(0) == bytes32(b"\x01" * 32)
+        assert await blocks.main_chain_hash_at(1) == peak
+        assert await blocks.main_chain_hash_at(2) == new_peak
+        assert await blocks.count_compactified_blocks() == 1
+        assert await blocks.count_uncompactified_blocks() == 2
+        assert await coins.num_unspent() == 2
+        async with chain.reader_no_transaction() as view:
+            assert await view.get(CF_BLOCK_BLOBS, bytes(new_peak)) == b"block-2"
+    finally:
+        await chain.close()
+
+
+@pytest.mark.anyio
+async def test_old_copy_without_the_block_marker_is_refused(tmp_path: Path) -> None:
+    sqlite_path = tmp_path / "chain.sqlite"
+    _write_sqlite(sqlite_path)
+    rocks_path = await migrate_database(
+        sqlite_path,
+        tmp_path / "out",
+        selected_network="mainnet",
+        constants=DEFAULT_CONSTANTS,
+        assume_source_headroom=True,
+    )
+    from chia.full_node.db.keys import CF_META, META_COMPLETE, META_MIGRATE_BLOCK_ROWID, META_MIGRATE_PHASE
+
+    chain = ChainDB(RocksBackend(rocks_path, sync="OFF"))
+    try:
+        async with chain.writer() as session:
+            session.put(CF_META, META_MIGRATE_PHASE, b"coins")
+            session.delete(CF_META, META_COMPLETE)
+            session.delete(CF_META, META_MIGRATE_BLOCK_ROWID)
+    finally:
+        await chain.close()
+    with pytest.raises(RuntimeError, match="faster chain step"):
+        await migrate_database(
+            sqlite_path,
+            tmp_path / "out",
+            selected_network="mainnet",
+            constants=DEFAULT_CONSTANTS,
+            assume_source_headroom=True,
+        )
 
 
 @pytest.mark.anyio

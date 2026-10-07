@@ -13,7 +13,9 @@ from chia.full_node.block_store import BlockStore
 from chia.full_node.coin_store import CoinStore
 from chia.full_node.db.block_store import RocksBlockStore
 from chia.full_node.db.chain_db import ChainDB
+from chia.full_node.db.keys import CF_MAIN_CHAIN, CF_META, ses_index_key, u32_be
 from chia.full_node.db.memory import MemoryBackend
+from chia.full_node.db.ops import Delete, DeleteRange, Op
 from chia.full_node.db.rocks import RocksBackend
 from chia.simulator.block_tools import BlockTools
 from chia.util.inline_executor import InlineExecutor
@@ -55,6 +57,67 @@ async def test_rocks_block_store_round_trip(tmp_path: Path, bt: BlockTools) -> N
     remaining = await store.get_block_records_in_range(0, blocks[-1].height)
     assert list(remaining) == [blocks[0].header_hash]
     assert await store.count_compactified_blocks() + await store.count_uncompactified_blocks() == 1
+
+
+class _RecordingBackend:
+    def __init__(self) -> None:
+        self.inner = MemoryBackend()
+        self.ops: list[Op] = []
+
+    async def get(self, cf: str, key: bytes) -> bytes | None:
+        return await self.inner.get(cf, key)
+
+    async def get_many(self, cf: str, keys: list[bytes]) -> dict[bytes, bytes]:
+        return await self.inner.get_many(cf, keys)
+
+    async def scan(
+        self, cf: str, start: bytes, end: bytes | None, *, limit: int | None = None
+    ) -> list[tuple[bytes, bytes]]:
+        return await self.inner.scan(cf, start, end, limit=limit)
+
+    async def apply(self, ops: list[Op]) -> None:
+        self.ops.extend(ops)
+        await self.inner.apply(ops)
+
+    async def close(self) -> None:
+        await self.inner.close()
+
+
+@pytest.mark.anyio
+async def test_rollback_removes_ses_rows_without_a_range_tombstone() -> None:
+    backend = _RecordingBackend()
+    store = await RocksBlockStore.create(ChainDB(backend))
+    await store.note_main_chain_ses(10, b"low")
+    await store.note_main_chain_ses(50, b"high")
+
+    # No main-chain row above the fork means nothing rolled back. Leave meta alone.
+    backend.ops.clear()
+    await store.rollback(40)
+    assert backend.ops == []
+    assert await store.stored_sub_epoch_summaries() == {10: b"low", 50: b"high"}
+
+    async with store.db.writer() as session:
+        session.put(CF_MAIN_CHAIN, u32_be(50), b"\x11" * 32)
+    backend.ops.clear()
+    await store.rollback(40)
+    assert await store.stored_sub_epoch_summaries() == {10: b"low"}
+    assert Delete(CF_META, ses_index_key(50)) in [op for op in backend.ops if isinstance(op, Delete)]
+    assert not any(isinstance(op, DeleteRange) for op in backend.ops)
+
+
+@pytest.mark.anyio
+async def test_rocks_get_and_get_many_round_trip(tmp_path: Path) -> None:
+    path = tmp_path / "chain.rocksdb"
+    database = ChainDB(RocksBackend(path, sync="OFF"))
+    async with database.writer() as session:
+        session.put("meta", b"a", b"1")
+        session.put("meta", b"b", b"2")
+    async with database.reader_no_transaction() as view:
+        assert await view.get("meta", b"a") == b"1"
+        assert await view.get("meta", b"missing") is None
+        assert await view.get_many("meta", [b"b", b"missing", b"a"]) == {b"a": b"1", b"b": b"2"}
+        assert await view.get_many("meta", []) == {}
+    await database.close()
 
 
 @pytest.mark.anyio

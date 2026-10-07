@@ -18,6 +18,45 @@ def chain_db() -> ChainDB:
 
 
 @pytest.mark.anyio
+async def test_parent_family_is_dropped_on_open(tmp_path: Path) -> None:
+    from rocksdict import Options, Rdict
+
+    from chia.full_node.db.rocks import RocksBackend
+
+    path = tmp_path / "chain.rocksdb"
+    options = Options(raw_mode=True)
+    options.create_if_missing(True)
+    options.create_missing_column_families(True)
+    default = Options(raw_mode=True)
+    parent = Options(raw_mode=True)
+    db = Rdict(
+        str(path),
+        options=options,
+        column_families={"default": default, "coins_by_parent": parent},
+    )
+    db.close()
+    chain = ChainDB(RocksBackend(path, sync="OFF"))
+    await chain.close()
+    assert "coins_by_parent" not in Rdict.list_cf(str(path))
+
+
+@pytest.mark.anyio
+async def test_reads_do_not_leave_a_write_ahead_file_each(tmp_path: Path) -> None:
+    from chia.full_node.db.rocks import RocksBackend
+
+    path = tmp_path / "chain.rocksdb"
+    chain = ChainDB(RocksBackend(path, sync="NORMAL"))
+    async with chain.writer() as session:
+        session.put("meta", b"k", b"v")
+    for _ in range(30):
+        async with chain.reader_no_transaction() as view:
+            assert await view.get("meta", b"k") == b"v"
+    wal_count = len(list(path.glob("*.log")))
+    await chain.close()
+    assert wal_count <= 4
+
+
+@pytest.mark.anyio
 async def test_old_diagnostic_logs_are_capped(tmp_path: Path) -> None:
     from chia.full_node.db.rocks import RocksBackend
 
