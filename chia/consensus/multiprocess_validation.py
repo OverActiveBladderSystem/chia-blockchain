@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+import asyncio
+import copy
 import logging
+import threading
 import time
 import traceback
-from collections.abc import Awaitable, Collection
+from collections import OrderedDict
+from collections.abc import Awaitable, Collection, Mapping, Sequence
+from concurrent.futures import Future
 from dataclasses import dataclass
+from typing import Any
 
 from chia_rs import (
     BlockRecord,
@@ -41,7 +47,9 @@ from chia.consensus.pot_iterations import (
     is_overflow_block,
     validate_pospace_and_get_required_iters,
 )
+from chia.types.blockchain_format.classgroup import ClassgroupElement
 from chia.types.blockchain_format.coin import Coin
+from chia.types.blockchain_format.vdf import validate_vdf
 from chia.types.generator_types import BlockGenerator
 from chia.types.validation_state import ValidationState
 from chia.util.errors import Err
@@ -90,6 +98,202 @@ def _run_block(
         constants,
     )
     return None if error is None else Err(error), error_msg, conds
+
+
+# Programs run before their block is linked. Reused only when the real check
+# selects the same rule flags and the same older program bytes.
+_PROGRAM_CACHE_LIMIT = 256
+_program_cache_lock = threading.Lock()
+_program_cache: OrderedDict[bytes32, tuple[int, bytes32, SpendBundleConditions | None, Err | None, str | None]] = (
+    OrderedDict()
+)
+
+
+def program_refs_digest(prev_generators: list[bytes]) -> bytes32:
+    """Identity of the older programs a cached run used."""
+    parts = [len(prev_generators).to_bytes(4, "big")]
+    for program in prev_generators:
+        parts.append(len(program).to_bytes(4, "big"))
+        parts.append(program)
+    return std_hash(b"".join(parts))
+
+
+def earlier_programs_for_block(block: FullBlock, generators: Mapping[int, bytes]) -> list[bytes] | None:
+    """Older program bytes this block names, in list order.
+
+    None when any named height is missing from ``generators``. An empty list
+    means the program does not name an older one.
+    """
+    programs: list[bytes] = []
+    for height in block.transactions_generator_ref_list:
+        program = generators.get(int(height))
+        if program is None:
+            return None
+        programs.append(program)
+    return programs
+
+
+def program_can_be_precomputed(block: FullBlock, generators: Mapping[int, bytes] | None = None) -> bool:
+    """True when this block's transaction program can run before the chain links it.
+
+    A non-transaction block and a reward-only transaction block have no program.
+    Their proof math is a separate job and does not use this function. A program
+    that names older programs can run once those bytes are already in ``generators``.
+    """
+    if not block_has_transactions_generator(block):
+        return False
+    if block.transactions_info is None or block.foliage_transaction_block is None:
+        return False
+    if generators is None:
+        return len(block.transactions_generator_ref_list) == 0
+    return earlier_programs_for_block(block, generators) is not None
+
+
+def remember_precomputed_program(
+    header_hash: bytes32,
+    flags: int,
+    refs_digest: bytes32,
+    conds: SpendBundleConditions | None,
+    err: Err | None,
+    err_msg: str | None,
+) -> None:
+    with _program_cache_lock:
+        _program_cache[header_hash] = (flags, refs_digest, conds, err, err_msg)
+        _program_cache.move_to_end(header_hash)
+        while len(_program_cache) > _PROGRAM_CACHE_LIMIT:
+            _program_cache.popitem(last=False)
+
+
+def take_precomputed_program(
+    header_hash: bytes32,
+    flags: int,
+    prev_generators: list[bytes],
+) -> tuple[Err | None, str | None, SpendBundleConditions | None] | None:
+    """Return a saved program result when the rules and older programs match.
+
+    A result from a different rule set, or from different older programs, is
+    dropped. The block is then run normally.
+    """
+    digest = program_refs_digest(prev_generators)
+    with _program_cache_lock:
+        cached = _program_cache.pop(header_hash, None)
+    if cached is None or cached[0] != flags or cached[1] != digest:
+        return None
+    return cached[3], cached[4], cached[2]
+
+
+def precompute_block_proofs(constants: ConsensusConstants, block: FullBlock) -> None:
+    """Run the proof math that is already written inside this block.
+
+    Reward-chain proofs, and challenge-chain proofs that start from the
+    identity, carry their own challenge and iteration count. The later check
+    still decides whether that proof belongs on the previous block. Running
+    the math now leaves the answer ready for that check.
+    """
+    try:
+        identity = ClassgroupElement.get_default_element()
+        reward = block.reward_chain_block
+        validate_vdf(block.reward_chain_ip_proof, constants, identity, reward.reward_chain_ip_vdf)
+        if block.reward_chain_sp_proof is not None and reward.reward_chain_sp_vdf is not None:
+            validate_vdf(block.reward_chain_sp_proof, constants, identity, reward.reward_chain_sp_vdf)
+        if block.challenge_chain_ip_proof.normalized_to_identity:
+            validate_vdf(block.challenge_chain_ip_proof, constants, identity, reward.challenge_chain_ip_vdf)
+        signage_proof = block.challenge_chain_sp_proof
+        if (
+            signage_proof is not None
+            and signage_proof.normalized_to_identity
+            and reward.challenge_chain_sp_vdf is not None
+        ):
+            validate_vdf(signage_proof, constants, identity, reward.challenge_chain_sp_vdf)
+        for sub_slot in block.finished_sub_slots:
+            validate_vdf(
+                sub_slot.proofs.reward_chain_slot_proof,
+                constants,
+                identity,
+                sub_slot.reward_chain.end_of_slot_vdf,
+            )
+            slot_proof = sub_slot.proofs.challenge_chain_slot_proof
+            if slot_proof.normalized_to_identity:
+                validate_vdf(
+                    slot_proof,
+                    constants,
+                    identity,
+                    sub_slot.challenge_chain.challenge_chain_end_of_slot_vdf,
+                )
+            infused = sub_slot.infused_challenge_chain
+            infused_proof = sub_slot.proofs.infused_challenge_chain_slot_proof
+            if infused is not None and infused_proof is not None and infused_proof.normalized_to_identity:
+                validate_vdf(
+                    infused_proof,
+                    constants,
+                    identity,
+                    infused.infused_challenge_chain_end_of_slot_vdf,
+                )
+    except Exception:
+        log.exception("precompute block proofs failed")
+
+
+def precompute_transaction_program(
+    constants: ConsensusConstants, block: FullBlock, prev_generators: list[bytes]
+) -> None:
+    """Run one transaction program on a background worker.
+
+    ``block.height`` supplies the rule flags. The later check repeats the run
+    when the real previous-transaction height selects different flags, or when
+    the chain's older programs are not these bytes.
+    """
+    if not block_has_transactions_generator(block):
+        return
+    if block.transactions_info is None or block.foliage_transaction_block is None:
+        return
+    generator_bytes = get_transactions_generator_bytes(block)
+    if generator_bytes is None:
+        return
+    flags = int(get_flags_for_height_and_constants(uint32(block.height), constants))
+    err: Err | None
+    err_msg: str | None
+    conds: SpendBundleConditions | None
+    if std_hash(generator_bytes) != block.transactions_info.generator_root:
+        err, err_msg, conds = Err.INVALID_TRANSACTIONS_GENERATOR_HASH, None, None
+    elif block.foliage_transaction_block.transactions_info_hash != block.transactions_info.get_hash():
+        err, err_msg, conds = Err.INVALID_TRANSACTIONS_INFO_HASH, None, None
+    elif block.foliage.foliage_transaction_block_hash != block.foliage_transaction_block.get_hash():
+        err, err_msg, conds = Err.INVALID_FOLIAGE_BLOCK_HASH, None, None
+    elif block.transactions_info.cost > constants.MAX_BLOCK_COST_CLVM:
+        err, err_msg, conds = Err.BLOCK_COST_EXCEEDS_MAX, None, None
+    else:
+        try:
+            err, err_msg, conds = _run_block(block, prev_generators, uint32(block.height), constants)
+        except Exception:
+            log.exception("precompute transaction program failed")
+            return
+        if err is None and (conds is None or conds.validated_signature is not True):
+            return
+    remember_precomputed_program(block.header_hash, flags, program_refs_digest(prev_generators), conds, err, err_msg)
+
+
+async def _await_block_math(
+    math_futures: Sequence[Future[Any]],
+    phase_times: dict[str, float] | None,
+    height: int,
+) -> None:
+    """Wait for this block's math on the event loop.
+
+    Records whether every job had already finished. A pool worker must not be
+    the one waiting: if every worker waited on another job, the pool would stall.
+    """
+    ready = all(earlier.done() for earlier in math_futures)
+    started = time.monotonic()
+    for earlier in math_futures:
+        try:
+            await asyncio.wrap_future(earlier)
+        except Exception:
+            log.exception("block math failed at height %s", height)
+    if phase_times is not None:
+        phase_times["math_wait"] = time.monotonic() - started
+        phase_times["math_queued"] = 1.0
+        if ready:
+            phase_times["math_ready"] = 1.0
 
 
 def _pre_validate_block(
@@ -158,9 +362,17 @@ def _pre_validate_block(
                 if not is_canonical_serialization(generator_bytes):
                     return error_result(Err.INVALID_TRANSACTIONS_GENERATOR_ENCODING)
 
-            clvm_started = time.monotonic()
-            err, err_msg, conds = _run_block(block, prev_generators, prev_tx_height, constants)
-            clvm_run = time.monotonic() - clvm_started
+            flags = int(get_flags_for_height_and_constants(prev_tx_height, constants))
+            cached = take_precomputed_program(block.header_hash, flags, prev_generators)
+            if cached is not None:
+                err, err_msg, conds = cached
+                clvm_run = 0.0
+                if phase_times is not None:
+                    phase_times["precomputed"] = 1.0
+            else:
+                clvm_started = time.monotonic()
+                err, err_msg, conds = _run_block(block, prev_generators, prev_tx_height, constants)
+                clvm_run = time.monotonic() - clvm_started
 
             assert (err is None) != (conds is None)
             if err is not None:
@@ -214,6 +426,7 @@ async def pre_validate_block(
     nice: _SupportsLessThan = (0,),
     dedicated: bool = True,
     phase_times: dict[str, float] | None = None,
+    math_futures: Sequence[Future[Any]] | None = None,
 ) -> Awaitable[PreValidationResult]:
     """
     This method must be called under the blockchain lock
@@ -346,21 +559,36 @@ async def pre_validate_block(
 
     blockchain.add_extra_block(block, block_rec)  # Temporarily add block to chain
     readonly_blockchain = blockchain.read_only_snapshot()
+    # Later blocks in this batch update ``expected_vs``. A check that waits for
+    # math already running must keep the state from this block.
+    worker_vs = copy.copy(expected_vs) if math_futures else expected_vs
 
-    future = pool.run_in_loop(
-        _pre_validate_block,
-        constants,
-        readonly_blockchain,
-        block,
-        previous_generators,
-        conds,
-        prev_tx_height,
-        expected_vs,
-        skip_commitment_validation=skip_commitment_validation,
-        phase_times=phase_times,
-        nice=nice,
-        dedicated=dedicated,
-    )
+    def start_check() -> Awaitable[PreValidationResult]:
+        return pool.run_in_loop(
+            _pre_validate_block,
+            constants,
+            readonly_blockchain,
+            block,
+            previous_generators,
+            conds,
+            prev_tx_height,
+            worker_vs,
+            skip_commitment_validation=skip_commitment_validation,
+            phase_times=phase_times,
+            nice=nice,
+            dedicated=dedicated,
+        )
+
+    if math_futures:
+        pending_math = tuple(math_futures)
+
+        async def check_after_math() -> PreValidationResult:
+            await _await_block_math(pending_math, phase_times, int(block.height))
+            return await start_check()
+
+        future: Awaitable[PreValidationResult] = asyncio.ensure_future(check_after_math())
+    else:
+        future = start_check()
 
     if block_rec.sub_epoch_summary_included is not None:
         vs.prev_ses_block = block_rec

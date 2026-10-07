@@ -194,6 +194,30 @@ class BlockHeightMap:
         await self.maybe_flush()
         return self
 
+    @classmethod
+    async def write_startup_files(
+        cls,
+        blockchain_dir: Path,
+        selected_network: str | None,
+        height_to_hash: bytearray,
+        summaries: dict[int, bytes],
+    ) -> None:
+        """Write both startup files from hashes and summaries already collected."""
+        self = cls()
+        self.db = None
+        self._chain_window = None
+        self.__counter = 0
+        self.__first_dirty = 0
+        self.__height_to_hash = height_to_hash
+        self.__sub_epoch_summaries = {
+            uint32(height): summary for height, summary in sorted(summaries.items())
+        }
+        suffix = "" if (selected_network is None or selected_network == "mainnet") else f"-{selected_network}"
+        self.__height_to_hash_filename = blockchain_dir / f"height-to-hash{suffix}"
+        self.__ses_filename = blockchain_dir / f"sub-epoch-summaries{suffix}"
+        await self.write_height_file()
+        await self.write_ses_file()
+
     def ensure_capacity(self, height: int) -> None:
         needed = (height + 1) * 32
         current = len(self.__height_to_hash)
