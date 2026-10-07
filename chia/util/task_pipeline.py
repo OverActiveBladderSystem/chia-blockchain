@@ -78,6 +78,7 @@ class TaskPipeline:
 
         tasks = [asyncio.ensure_future(self._run_feeder())]
         tasks.extend(asyncio.ensure_future(self._run_stage(i)) for i in range(len(self._stages)))
+        cancelled = False
 
         try:
             all_done: asyncio.Task[Any] = asyncio.ensure_future(asyncio.gather(*tasks, return_exceptions=True))
@@ -96,13 +97,17 @@ class TaskPipeline:
                 with contextlib.suppress(asyncio.CancelledError):
                     await all_done
         except asyncio.CancelledError:
+            # current_task().cancelling() is already zero once this handler runs.
+            cancelled = True
             self._failed.set()
             for t in tasks:
                 t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
             raise
         finally:
-            if self._cleanup is not None:
+            # Shutdown cancels this run while block checks are still in flight.
+            # Waiting on those checks held the chain database open.
+            if self._cleanup is not None and not cancelled:
                 await self._cleanup(self)
 
         if self._exception is not None:

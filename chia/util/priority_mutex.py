@@ -94,3 +94,15 @@ class PriorityMutex(Generic[_T_Priority]):
                     self._active = element
                     element.ready_event.set()
                     break
+
+    def has_waiters(self) -> bool:
+        """True when a task is queued behind whoever holds the mutex now.
+
+        A block save calls this before it lets go, so a pack does not start
+        while the next save is already waiting.
+        """
+        for pending in self._deques.values():
+            for element in pending:
+                if element is not self._active:
+                    return True
+        return False
