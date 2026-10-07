@@ -35,7 +35,7 @@ from chia_rs import (
     get_flags_for_height_and_constants,
 )
 from chia_rs.sized_bytes import bytes32
-from chia_rs.sized_ints import uint8, uint16, uint32, uint64, uint128
+from chia_rs.sized_ints import int16, uint8, uint16, uint32, uint64, uint128
 from packaging.version import Version
 
 from chia._tests.blockchain.blockchain_test_utils import _validate_and_add_block, _validate_and_add_block_no_error
@@ -66,7 +66,7 @@ from chia.consensus.multiprocess_validation import PreValidationResult, pre_vali
 from chia.consensus.pot_iterations import calculate_sp_iters, is_overflow_block
 from chia.consensus.signage_point import SignagePoint
 from chia.full_node import full_node as full_node_module
-from chia.full_node.full_node import FullNode, WalletUpdate
+from chia.full_node.full_node import FullNode, WalletUpdate, _block_reply_label, _refusal_backoff_seconds
 from chia.full_node.full_node_api import FullNodeAPI, tx_request_and_timeout
 from chia.full_node.sync_store import Peak
 from chia.full_node.tx_processing_queue import PeerWithTx
@@ -77,7 +77,7 @@ from chia.protocols.full_node_protocol import NewTransaction, RespondTransaction
 from chia.protocols.outbound_message import Message, NodeType, make_msg
 from chia.protocols.protocol_message_types import ProtocolMessageTypes
 from chia.protocols.protocol_timing import CONSENSUS_ERROR_BAN_SECONDS
-from chia.protocols.shared_protocol import Capability, default_capabilities
+from chia.protocols.shared_protocol import Capability, Error, default_capabilities
 from chia.protocols.wallet_protocol import RespondHeaderBlocks, SendTransaction, TransactionAck
 from chia.server.address_manager import AddressManager
 from chia.server.node_discovery import FullNodePeers
@@ -3578,6 +3578,111 @@ async def test_sync_from_fork_point_bans_peer_answering_wrong_block_range(
     assert peer.ban_seconds == CONSENSUS_ERROR_BAN_SECONDS
     # the range is requested once from this peer, which is then dropped rather than retried
     assert peer.requests == [(uint32(0), target.height)]
+    assert full_node.blockchain.get_peak() is None
+
+
+@pytest.mark.anyio
+async def test_sync_from_fork_point_asks_another_peer_when_the_first_is_slow(
+    one_node: SimulatorsAndWalletsServices,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The first peer is still answering. About a second later the same heights
+    # are asked of another peer, so a slow reply is not the only request out.
+    [full_node_service], _, bt = one_node
+    full_node = full_node_service._node
+    blocks = bt.get_consecutive_blocks(5)
+    target = blocks[-1]
+    starts: list[float] = []
+
+    class DummyPeer:
+        def __init__(self, host: str) -> None:
+            self.closed = False
+            self.peer_info = PeerInfo(host, uint16(8444))
+
+        async def call_api(self, *args: object, **kwargs: object) -> full_node_protocol.RespondBlocks:
+            starts.append(time.monotonic())
+            # Whoever is asked first is slow. The other peer should be asked for
+            # the same heights while this call is still running.
+            if len(starts) == 1:
+                await asyncio.sleep(2.0)
+            request = args[1]
+            assert isinstance(request, full_node_protocol.RequestBlocks)
+            return full_node_protocol.RespondBlocks(request.start_height, request.end_height, [])
+
+        async def close(self, *args: object, **kwargs: object) -> None:
+            self.closed = True
+
+    peers = [DummyPeer("1.1.1.1"), DummyPeer("2.2.2.2")]
+    monkeypatch.setattr(full_node, "get_peers_with_peak", lambda _peak_hash: peers)
+
+    await asyncio.wait_for(
+        full_node.sync_from_fork_point(uint32(0), target.height, target.header_hash, []),
+        timeout=30,
+    )
+
+    assert len(starts) >= 2
+    assert 0.9 <= starts[1] - starts[0] < 1.4
+    assert full_node.blockchain.get_peak() is None
+
+
+def test_refusal_backoff_doubles_until_the_cap() -> None:
+    assert _refusal_backoff_seconds(2, 1) == 2
+    assert _refusal_backoff_seconds(2, 2) == 4
+    assert _refusal_backoff_seconds(2, 3) == 8
+    assert _refusal_backoff_seconds(2, 20) == 60
+
+
+def test_block_reply_label_names_the_reply() -> None:
+    assert _block_reply_label(full_node_protocol.RejectBlocks(uint32(5), uint32(36))) == "refused 5-36"
+    label = _block_reply_label(Error(int16(Err.UNKNOWN.value), "missing", None))
+    assert label == "error UNKNOWN: missing"
+    assert _block_reply_label(object()).startswith("unexpected ")
+
+
+@pytest.mark.anyio
+async def test_sync_from_fork_point_backs_off_a_peer_that_refuses(
+    one_node: SimulatorsAndWalletsServices,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # A peer that declines the range is not asked again immediately. The next
+    # try waits out the backoff, and the log names the refusal.
+    [full_node_service], _, bt = one_node
+    full_node = full_node_service._node
+    blocks = bt.get_consecutive_blocks(5)
+    target = blocks[-1]
+
+    class DummyPeer:
+        def __init__(self, host: str, *, refuse_first: bool) -> None:
+            self.closed = False
+            self.peer_info = PeerInfo(host, uint16(8444))
+            self.refuse_first = refuse_first
+            self.times: list[float] = []
+
+        async def call_api(self, *args: object, **kwargs: object) -> object:
+            self.times.append(time.monotonic())
+            request = args[1]
+            assert isinstance(request, full_node_protocol.RequestBlocks)
+            if self.refuse_first and len(self.times) == 1:
+                return full_node_protocol.RejectBlocks(request.start_height, request.end_height)
+            return full_node_protocol.RespondBlocks(request.start_height, request.end_height, [])
+
+        async def close(self, *args: object, **kwargs: object) -> None:
+            self.closed = True
+
+    refuser = DummyPeer("9.9.9.9", refuse_first=True)
+    other = DummyPeer("8.8.8.8", refuse_first=False)
+    monkeypatch.setattr(full_node, "get_peers_with_peak", lambda _peak_hash: [refuser, other])
+    caplog.set_level(logging.INFO)
+
+    await asyncio.wait_for(
+        full_node.sync_from_fork_point(uint32(0), target.height, target.header_hash, []),
+        timeout=30,
+    )
+
+    assert len(refuser.times) >= 2
+    assert refuser.times[1] - refuser.times[0] >= 1.8
+    assert "refused" in caplog.text
     assert full_node.blockchain.get_peak() is None
 
 

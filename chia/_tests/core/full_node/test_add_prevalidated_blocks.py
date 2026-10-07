@@ -16,8 +16,9 @@ from chia_rs.sized_bytes import bytes32
 from chia_rs.sized_ints import uint16, uint32, uint64
 
 from chia.consensus.block_body_validation import ForkInfo
+from chia.consensus.blockchain import AddBlockResult
 from chia.consensus.multiprocess_validation import PreValidationResult
-from chia.full_node.full_node import FullNode
+from chia.full_node.full_node import FullNode, _batch_phase_totals
 from chia.types.peer_info import PeerInfo
 from chia.types.validation_state import ValidationState
 from chia.util.errors import Err
@@ -119,3 +120,59 @@ async def test_prevalidation_none_required_iters_returns_err() -> None:
     assert err is not None, "Expected an error to be returned"
     assert err == Err.UNKNOWN
     assert summary is None
+
+
+def test_batch_phase_totals_sums_each_step() -> None:
+    totals = _batch_phase_totals(
+        [
+            {"generator_read": 0.2, "clvm_run": 1.5, "coin_lookups": 10, "math_ready": 1, "math_queued": 1},
+            {
+                "generator_read": 0.3,
+                "db_write": 0.4,
+                "coin_lookups": 4,
+                "math_queued": 1,
+                "math_wait": 0.25,
+            },
+        ]
+    )
+    assert totals["generator_read"] == pytest.approx(0.5)
+    assert totals["clvm_run"] == pytest.approx(1.5)
+    assert totals["db_write"] == pytest.approx(0.4)
+    assert totals["header"] == pytest.approx(0.0)
+    assert totals["coin_lookups"] == pytest.approx(14.0)
+    assert totals["math_ready"] == pytest.approx(1.0)
+    assert totals["math_queued"] == pytest.approx(2.0)
+    assert totals["math_wait"] == pytest.approx(0.25)
+
+
+@pytest.mark.anyio
+async def test_add_prevalidated_blocks_records_phase_times() -> None:
+    """Long-sync saves pass the per-block timing dict into add_block."""
+    fake_self = _make_fake_self()
+    block = _make_fake_block()
+    result = PreValidationResult(
+        error=None,
+        error_msg=None,
+        required_iters=uint64(1),
+        conds=None,
+        timing=uint32(0),
+    )
+    block_record = SimpleNamespace(sub_epoch_summary_included=None)
+    blockchain = SimpleNamespace(block_record=lambda _header_hash: block_record, remove_extra_block=lambda _hh: None)
+    phase = {"generator_read": 0.25}
+    fake_self.blockchain.add_block = AsyncMock(return_value=(AddBlockResult.INVALID_BLOCK, Err.INVALID_POSPACE, None))
+
+    summary, err = await FullNode.add_prevalidated_blocks(
+        fake_self,  # type: ignore[arg-type]
+        blockchain,  # type: ignore[arg-type]
+        [block],  # type: ignore[list-item]
+        [result],
+        _make_fork_info(),
+        PeerInfo("127.0.0.1", uint16(8444)),
+        _make_validation_state(),
+        phases=[phase],
+    )
+
+    assert summary is None
+    assert err == Err.INVALID_POSPACE
+    assert fake_self.blockchain.add_block.await_args.kwargs["phase_times"] is phase
