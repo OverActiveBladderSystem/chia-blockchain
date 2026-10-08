@@ -1496,38 +1496,6 @@ def launch_service(root_path: Path, service_command: str) -> tuple[subprocess.Po
     return process, pid_path
 
 
-def kill_service_process(process: subprocess.Popen[Any]) -> None:
-    """Stop one service process.
-
-    On Windows the recorded pid is often the ``.cmd`` launcher. Ending only
-    that process leaves the real interpreter running, still holding the database.
-    ``taskkill /T`` ends the launcher and every process it started.
-    """
-    if sys.platform in {"win32", "cygwin"}:
-        if _kill_windows_process_tree(process.pid):
-            return
-        # taskkill fails when the process has already exited.
-        if process.poll() is not None:
-            return
-        log.warning("taskkill did not stop process %s; ending that process only", process.pid)
-    try:
-        process.kill()
-    except OSError:
-        return
-
-
-def _kill_windows_process_tree(pid: int) -> bool:
-    try:
-        completed = subprocess.run(
-            ["taskkill", "/F", "/T", "/PID", str(pid)],
-            check=False,
-            capture_output=True,
-        )
-    except OSError:
-        return False
-    return completed.returncode == 0
-
-
 async def kill_processes(
     processes: list[subprocess.Popen[Any]],
     root_path: Path,
@@ -1556,7 +1524,7 @@ async def kill_processes(
     else:
         log.info("sending kill signal to %s", service_name)
         for process in processes:
-            kill_service_process(process)
+            process.kill()
     for process in processes:
         r = process.wait()
         log.info("process %s returned %d", service_name, r)
