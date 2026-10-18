@@ -27,6 +27,11 @@ class MemoryBackend:
             return rows
         return rows[:limit]
 
+    async def scan_prefixes(
+        self, cf: str, ranges: list[tuple[bytes, bytes | None]]
+    ) -> list[list[tuple[bytes, bytes]]]:
+        return [await self.scan(cf, start, end) for start, end in ranges]
+
     async def apply(self, ops: list[Op]) -> None:
         for op in ops:
             family = self.data[op.cf]

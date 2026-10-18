@@ -23,6 +23,7 @@ from chia.full_node.db.keys import (
     CF_BLOCK_BLOBS,
     CF_BLOCK_META,
     CF_BLOCKS_AT_HEIGHT,
+    CF_COIN_DELTA,
     CF_COINS,
     CF_COINS_BY_CONFIRMED,
     CF_COINS_BY_PUZZLE_CONFIRMED,
@@ -45,6 +46,7 @@ from chia.full_node.db.keys import (
     META_MIGRATE_SOURCE,
     META_SCHEMA_VERSION,
     ROCKS_SUFFIX,
+    u32_be,
 )
 from chia.full_node.db.rocks import RocksBackend
 from chia.full_node.db.startup import unfinished_migration_reason
@@ -62,6 +64,16 @@ _HINT_BATCH = 20000
 _SUMMARY_BATCH = 8
 _SUMMARY_BYTES = 32 * 1024 * 1024
 _HEIGHT_WINDOW = 100_000
+# Written with the log off during the coin snapshot. Flush these before the step
+# name changes, or a stop during pack can drop the tail and the rerun will not copy it.
+_COIN_SNAPSHOT_FAMILIES: tuple[str, ...] = (
+    CF_COINS,
+    CF_COINS_BY_CONFIRMED,
+    CF_COINS_BY_SPENT,
+    CF_COINS_BY_PUZZLE_CONFIRMED,
+    CF_COINS_BY_PUZZLE_SPENT,
+    CF_FF_UNSPENT,
+)
 _MERGE_FAMILIES: tuple[tuple[str, str], ...] = (
     (CF_BLOCK_BLOBS, "block files"),
     (CF_BLOCK_META, "block records"),
@@ -609,6 +621,8 @@ async def _copy_snapshot(
             )
         finally:
             await db.execute("ROLLBACK")
+    for family in _COIN_SNAPSHOT_FAMILIES:
+        await chain.flush(family)
     await _put_meta(chain, META_MIGRATE_PHASE, b"merge")
 
 
@@ -1046,9 +1060,21 @@ async def _follow(
                 raise RuntimeError(f"follow did not advance past height {nxt}")
             row = await _main_block_row(db, nxt)
         if row is None:
-            return
+            raise MigrationPaused(
+                "The SQLite chain changed while the copy was catching up. "
+                "The copy was not marked finished. Run chia db migrate again."
+            )
+        header_hash = bytes32(row[0])
+        existing_hash = await block_store.main_chain_hash_at(nxt)
+        if existing_hash is not None and existing_hash != header_hash:
+            async with chain.writer():
+                await coin_store.rollback_to_block(int(rocks_peak[1]))
+                await block_store.rollback(int(rocks_peak[1]))
+                await block_store.set_peak(rocks_peak[0])
+            previous_height = -1
+            continue
         log.info("follow height %s toward %s", nxt, sqlite_height)
-        await _apply_followed_block(sqlite_path, row, block_store, coin_store, hint_store)
+        await _apply_followed_block(sqlite_path, row, chain, block_store, coin_store, hint_store)
         previous_height = nxt
         target_height = int(sqlite_height)
         _report(
@@ -1065,33 +1091,61 @@ async def _follow(
         await _put_meta(chain, META_MIGRATE_HEIGHT, nxt.to_bytes(4, "little", signed=False))
 
 
+def _row_amount(raw: object) -> int:
+    if isinstance(raw, (bytes, bytearray)):
+        return int.from_bytes(raw, "big")
+    if isinstance(raw, int):
+        return raw
+    raise TypeError(f"coin amount has type {type(raw).__name__}")
+
+
+async def _same_as_parent_by_name(
+    db: aiosqlite.Connection,
+    coins: list[tuple[bytes32, Coin]],
+    known: dict[bytes32, tuple[bytes, int]],
+) -> dict[bytes32, bool]:
+    """A fast-forward child has its parent's puzzle and amount, even after it has been spent."""
+    missing = [coin.parent_coin_info for _name, coin in coins if coin.parent_coin_info not in known]
+    for start in range(0, len(missing), 500):
+        batch = missing[start : start + 500]
+        placeholders = ",".join("?" for _ in batch)
+        cursor = await db.execute(
+            "SELECT coin_name, puzzle_hash, amount FROM coin_record WHERE coin_name IN (" + placeholders + ")",
+            batch,
+        )
+        for name, puzzle_hash, amount in await cursor.fetchall():
+            known[bytes32(name)] = (bytes(puzzle_hash), _row_amount(amount))
+        await cursor.close()
+    flags: dict[bytes32, bool] = {}
+    for name, coin in coins:
+        parent = known.get(coin.parent_coin_info)
+        flags[name] = parent is not None and parent[0] == bytes(coin.puzzle_hash) and parent[1] == int(coin.amount)
+    return flags
+
+
 async def _apply_followed_block(
     sqlite_path: Path,
     row: aiosqlite.Row,
+    chain: ChainDB,
     block_store: RocksBlockStore,
     coin_store: RocksCoinStore,
     hint_store: RocksHintStore,
 ) -> None:
-    """Apply one new main-chain height from the SQLite coin rows, without running the generator."""
+    """Apply one new main-chain height from the SQLite coin rows, without running the generator.
+
+    The block, coins, hints, and peak commit together. A stop in the middle leaves
+    the previous peak in place, so the next run applies this height again. If an
+    older run saved the coins and not the peak, the journal is already there and
+    this run only moves the peak.
+    """
     header_hash = bytes32(row[0])
     height = int(row[2])
-    await block_store.import_block_row(
-        header_hash,
-        bytes32(row[1]),
-        height,
-        row[3],
-        bool(row[4]),
-        True,
-        bytes(row[6]),
-        bytes(row[7]),
-    )
-    await block_store.set_in_chain([(header_hash,)])
     ses_raw = row[3]
-    await block_store.note_main_chain_ses(height, None if ses_raw is None else bytes(ses_raw))
-    additions: list[tuple[bytes32, Coin, bool]] = []
     rewards: list[Coin] = []
     removals: list[bytes32] = []
+    pending_additions: list[tuple[bytes32, Coin]] = []
     hints: list[tuple[bytes32, bytes]] = []
+    known: dict[bytes32, tuple[bytes, int]] = {}
     timestamp = 0
     async with aiosqlite.connect(sqlite_path) as db:
         cursor = await db.execute(
@@ -1105,23 +1159,26 @@ async def _apply_followed_block(
             name = bytes32(coin_row[0])
             confirmed = int(coin_row[1])
             spent = int(coin_row[2])
-            amount_raw = coin_row[6]
-            amount = int.from_bytes(amount_raw, "big") if isinstance(amount_raw, bytes) else int(amount_raw)
+            amount = _row_amount(coin_row[6])
             coin = Coin(bytes32(coin_row[5]), bytes32(coin_row[4]), uint64(amount))
+            known[name] = (bytes(coin_row[4]), amount)
             timestamp = max(timestamp, int(coin_row[7]))
             if confirmed == height:
                 if bool(coin_row[3]):
                     rewards.append(coin)
                 else:
-                    additions.append((name, coin, spent == -1))
+                    pending_additions.append((name, coin))
             if spent == height:
                 removals.append(name)
+        same_as_parent = await _same_as_parent_by_name(db, pending_additions, known)
+        additions = [(name, coin, same_as_parent[name]) for name, coin in pending_additions]
         if additions or rewards:
             names = [name for name, _, _ in additions]
             names.extend(coin.name() for coin in rewards)
+            placeholders = ",".join("?" for _ in names)
             try:
                 hint_cursor = await db.execute(
-                    f"SELECT coin_id, hint FROM hints WHERE coin_id IN ({','.join('?' for _ in names)})",
+                    "SELECT coin_id, hint FROM hints WHERE coin_id IN (" + placeholders + ")",
                     names,
                 )
             except aiosqlite.OperationalError:
@@ -1131,11 +1188,27 @@ async def _apply_followed_block(
                     if isinstance(hint, bytes) and len(hint) > 0:
                         hints.append((bytes32(coin_id), bytes(hint)))
                 await hint_cursor.close()
-    if additions or rewards or removals:
-        await coin_store.new_block(uint32(height), uint64(timestamp), rewards, additions, removals)
-    if hints:
-        await hint_store.add_hints(hints)
-    await block_store.set_peak(header_hash)
+    async with chain.writer():
+        await block_store.import_block_row(
+            header_hash,
+            bytes32(row[1]),
+            height,
+            ses_raw,
+            bool(row[4]),
+            True,
+            bytes(row[6]),
+            bytes(row[7]),
+        )
+        await block_store.set_in_chain([(header_hash,)])
+        await block_store.note_main_chain_ses(height, None if ses_raw is None else bytes(ses_raw))
+        if additions or rewards or removals:
+            async with coin_store.db.writer_maybe_transaction() as session:
+                already_applied = await session.get(CF_COIN_DELTA, u32_be(height))
+            if already_applied is None:
+                await coin_store.new_block(uint32(height), uint64(timestamp), rewards, additions, removals)
+        if hints:
+            await hint_store.add_hints(hints)
+        await block_store.set_peak(header_hash)
 
 
 async def _rollback_to_common(

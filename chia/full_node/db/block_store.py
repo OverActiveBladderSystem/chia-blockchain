@@ -424,14 +424,15 @@ class RocksBlockStore:
         if len(heights) == 0:
             return []
         blocks: list[FullBlock] = []
+        ranges = [(u32_be(int(height)), prefix_end(u32_be(int(height)))) for height in heights]
         async with self.db.reader_no_transaction() as view:
-            for height in heights:
-                prefix = u32_be(int(height))
-                rows = await view.scan(CF_BLOCKS_AT_HEIGHT, prefix, prefix_end(prefix))
-                for key, _value in rows:
-                    raw = await view.get(CF_BLOCK_BLOBS, key[-32:])
-                    if raw is not None:
-                        blocks.append(decompress(raw))
+            grouped = await view.scan_prefixes(CF_BLOCKS_AT_HEIGHT, ranges)
+            blob_keys = [key[-32:] for rows in grouped for key, _value in rows]
+            blobs = await view.get_many(CF_BLOCK_BLOBS, blob_keys)
+        for blob_key in blob_keys:
+            raw = blobs.get(blob_key)
+            if raw is not None:
+                blocks.append(decompress(raw))
         return blocks
 
     async def get_block_info(self, header_hash: bytes32) -> GeneratorBlockInfo | None:
@@ -479,23 +480,32 @@ class RocksBlockStore:
         if len(heights) == 0:
             return {}
         generators: dict[uint32, bytes] = {}
+        ordered_heights = list(heights)
         async with self.db.reader_no_transaction() as view:
-            for height in heights:
-                raw_hash = await view.get(CF_MAIN_CHAIN, u32_be(int(height)))
+            height_keys = [u32_be(int(height)) for height in ordered_heights]
+            main_chain = await view.get_many(CF_MAIN_CHAIN, height_keys)
+            blob_keys: list[bytes] = []
+            blob_heights: list[uint32] = []
+            for height, height_key in zip(ordered_heights, height_keys, strict=True):
+                raw_hash = main_chain.get(height_key)
                 if raw_hash is None:
                     continue
-                raw = await view.get(CF_BLOCK_BLOBS, raw_hash)
-                if raw is None:
-                    continue
-                block_bytes = zstd.decompress(raw)
-                try:
-                    gen = generator_from_block(memoryview(block_bytes))
-                except Exception as e:  # pragma: no cover
-                    log.error(f"cheap parser failed for block at height {height}: {e}")
-                    gen = get_transactions_generator_bytes(FullBlock.from_bytes(block_bytes))
-                if gen is None:
-                    raise ValueError(Err.GENERATOR_REF_HAS_NO_GENERATOR)
-                generators[uint32(height)] = gen
+                blob_keys.append(raw_hash)
+                blob_heights.append(height)
+            blobs = await view.get_many(CF_BLOCK_BLOBS, blob_keys)
+        for height, blob_key in zip(blob_heights, blob_keys, strict=True):
+            raw = blobs.get(blob_key)
+            if raw is None:
+                continue
+            block_bytes = zstd.decompress(raw)
+            try:
+                gen = generator_from_block(memoryview(block_bytes))
+            except Exception as e:  # pragma: no cover
+                log.error(f"cheap parser failed for block at height {height}: {e}")
+                gen = get_transactions_generator_bytes(FullBlock.from_bytes(block_bytes))
+            if gen is None:
+                raise ValueError(Err.GENERATOR_REF_HAS_NO_GENERATOR)
+            generators[height] = gen
         if len(generators) != len(heights):
             raise KeyError(Err.GENERATOR_REF_HAS_NO_GENERATOR)
         return generators
@@ -505,10 +515,12 @@ class RocksBlockStore:
             return []
         found: dict[bytes32, BlockRecord] = {}
         async with self.db.reader_no_transaction() as view:
-            for header_hash in header_hashes:
-                meta = await self._load_meta(view, header_hash)
-                if meta is not None:
-                    found[header_hash] = BlockRecord.from_bytes(meta.record)
+            raws = await view.get_many(CF_BLOCK_META, [bytes(header_hash) for header_hash in header_hashes])
+        for header_hash in header_hashes:
+            raw = raws.get(bytes(header_hash))
+            if raw is None:
+                continue
+            found[header_hash] = BlockRecord.from_bytes(decode_block_meta(raw).record)
         records: list[BlockRecord] = []
         for header_hash in header_hashes:
             if header_hash not in found:
@@ -645,14 +657,15 @@ class RocksBlockStore:
             return []
         found: dict[bytes32, FullBlock] = {}
         async with self.db.reader_no_transaction() as view:
-            for header_hash in header_hashes:
-                raw = await view.get(CF_BLOCK_BLOBS, bytes(header_hash))
-                if raw is None:
-                    continue
-                block = decompress(raw)
-                found[header_hash] = block
-                if cache:
-                    self.block_cache.put(header_hash, block)
+            raws = await view.get_many(CF_BLOCK_BLOBS, [bytes(header_hash) for header_hash in header_hashes])
+        for header_hash in header_hashes:
+            raw = raws.get(bytes(header_hash))
+            if raw is None:
+                continue
+            block = decompress(raw)
+            found[header_hash] = block
+            if cache:
+                self.block_cache.put(header_hash, block)
         ordered: list[FullBlock] = []
         for header_hash in header_hashes:
             block = found.get(header_hash)

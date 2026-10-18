@@ -87,6 +87,41 @@ class _View:
             return ordered[:limit]
         return ordered
 
+    async def scan_prefixes(
+        self, cf: str, ranges: list[tuple[bytes, bytes | None]]
+    ) -> list[list[tuple[bytes, bytes]]]:
+        if not ranges:
+            return []
+        pending = any(op.cf == cf for op in self._ops)
+        grouped = await self._backend.scan_prefixes(cf, ranges)
+        if not pending:
+            return grouped
+        merged: list[list[tuple[bytes, bytes]]] = []
+        for (start, end), rows in zip(ranges, grouped, strict=True):
+            found = dict(rows)
+            for op in self._ops:
+                if op.cf != cf:
+                    continue
+                if isinstance(op, Put):
+                    if key_in_range(op.key, start, end):
+                        found[op.key] = op.value
+                elif isinstance(op, Delete):
+                    if key_in_range(op.key, start, end):
+                        found.pop(op.key, None)
+                elif isinstance(op, DeleteRange):
+                    lo = start if start > op.start else op.start
+                    if end is None:
+                        hi = op.end
+                    elif op.end is None:  # pragma: no cover
+                        hi = end
+                    else:
+                        hi = end if end < op.end else op.end
+                    if lo < hi:
+                        for key in [key for key in found if key_in_range(key, lo, hi)]:
+                            del found[key]
+            merged.append(sorted(found.items(), key=lambda item: item[0]))
+        return merged
+
 
 class WriteSession(_View):
     def __init__(self, backend: KvBackend) -> None:
@@ -160,6 +195,14 @@ class ChainDB:
             return {name: 1 for name in names}
         async with self._lock:
             return await read(names)
+
+    async def flush(self, cf: str) -> None:
+        """Write this column family's memory buffer to a file."""
+        flush = getattr(self._backend, "flush", None)
+        if flush is None:
+            return
+        async with self._lock:
+            await flush(cf)
 
     async def merge_families(self, names: list[str]) -> None:
         merge = getattr(self._backend, "merge_families", None)

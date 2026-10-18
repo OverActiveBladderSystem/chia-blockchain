@@ -5,19 +5,52 @@ from collections.abc import Collection
 
 from chia_rs.sized_bytes import bytes32
 
-from chia.full_node.db.chain_db import ChainDB
+from chia.full_node.db.chain_db import ChainDB, _View
 from chia.full_node.db.keys import (
     CF_HINTS_BY_COIN,
     CF_HINTS_BY_HINT,
     CF_META,
+    INDEX_SCAN_CHUNK,
     META_FORMAT,
     META_FORMAT_VALUE,
     META_HINT_COUNT,
     META_SCHEMA_VERSION,
+    key_after,
     prefix_end,
 )
 
 log = logging.getLogger(__name__)
+
+
+async def _coins_for_hints(
+    view: _View, hints: list[bytes], *, max_items: int | None = None
+) -> list[bytes32]:
+    """Coin ids in hint order. A cap stops the walk once that many ids are collected."""
+    found: list[bytes32] = []
+    for hint in hints:
+        if max_items is not None and len(found) >= max_items:
+            break
+        start = hint
+        end = prefix_end(hint)
+        width = len(hint) + 32
+        while end is None or start < end:
+            room = None if max_items is None else max_items - len(found)
+            if room is not None and room <= 0:
+                break
+            limit = INDEX_SCAN_CHUNK if room is None or room > INDEX_SCAN_CHUNK else room
+            rows = await view.scan(CF_HINTS_BY_HINT, start, end, limit=limit)
+            if not rows:
+                break
+            for key, _value in rows:
+                if len(key) != width:
+                    continue
+                found.append(bytes32(key[-32:]))
+                if max_items is not None and len(found) >= max_items:
+                    return found
+            if len(rows) < limit:
+                break
+            start = key_after(rows[-1][0])
+    return found
 
 
 class RocksHintStore:
@@ -41,41 +74,28 @@ class RocksHintStore:
     async def get_coin_ids_multi(self, hints: set[bytes], *, max_items: int = 50000) -> list[bytes32]:
         if max_items <= 0:
             return []
-        coin_ids: list[bytes32] = []
         async with self.db.reader_no_transaction() as view:
-            for hint in hints:
-                rows = await view.scan(CF_HINTS_BY_HINT, hint, prefix_end(hint))
-                for key, _value in rows:
-                    if len(key) != len(hint) + 32:
-                        continue
-                    coin_ids.append(bytes32(key[-32:]))
-                    if len(coin_ids) >= max_items:
-                        return coin_ids
-        return coin_ids
+            return await _coins_for_hints(view, list(hints), max_items=max_items)
 
     async def get_coin_ids_by_hints(self, hints: Collection[bytes]) -> set[bytes32]:
         if len(hints) == 0:
             return set()
-        found: set[bytes32] = set()
         async with self.db.reader_no_transaction() as view:
-            for hint in hints:
-                rows = await view.scan(CF_HINTS_BY_HINT, hint, prefix_end(hint))
-                for key, _value in rows:
-                    if len(key) != len(hint) + 32:
-                        continue
-                    found.add(bytes32(key[-32:]))
-        return found
+            found = await _coins_for_hints(view, list(hints))
+        return set(found)
 
     async def get_hints(self, coin_ids: list[bytes32]) -> list[bytes32]:
+        if len(coin_ids) == 0:
+            return []
+        ranges = [(bytes(coin_id), prefix_end(bytes(coin_id))) for coin_id in coin_ids]
         hints: list[bytes32] = []
         async with self.db.reader_no_transaction() as view:
-            for coin_id in coin_ids:
-                prefix = bytes(coin_id)
-                rows = await view.scan(CF_HINTS_BY_COIN, prefix, prefix_end(prefix))
-                for key, _value in rows:
-                    hint = key[32:]
-                    if len(hint) == 32:
-                        hints.append(bytes32(hint))
+            grouped = await view.scan_prefixes(CF_HINTS_BY_COIN, ranges)
+        for rows in grouped:
+            for key, _value in rows:
+                hint = key[32:]
+                if len(hint) == 32:
+                    hints.append(bytes32(hint))
         return hints
 
     async def add_hints(self, coin_hint_list: list[tuple[bytes32, bytes]], *, assume_new: bool = False) -> None:

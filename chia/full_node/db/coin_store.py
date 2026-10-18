@@ -30,8 +30,10 @@ from chia.full_node.db.keys import (
     CF_FF_UNSPENT,
     CF_HINTS_BY_HINT,
     CF_META,
+    INDEX_SCAN_CHUNK,
     META_COIN_INDEXED,
     META_UNSPENT,
+    key_after,
     prefix_end,
     u32_be,
     u32_from_be,
@@ -46,21 +48,43 @@ log = logging.getLogger(__name__)
 COIN_INDEX_CHUNK = 32
 
 
+# A reorg can commit between two reads. Retry until the journal and the coin rows agree.
+_HEIGHT_READ_ATTEMPTS = 4
+
+
 class RocksCoinStore:
     """Current-peak UTXO set stored in the chain RocksDB."""
 
-    def __init__(self, db: ChainDB) -> None:
+    def __init__(self, db: ChainDB, reward_parent_prefixes: tuple[bytes, bytes] | None = None) -> None:
         self.db = db
+        # Farmer and pool reward parents are not coins. Each prefix is 16 bytes of
+        # the genesis challenge, and the other 16 bytes are the block height.
+        self._reward_parent_prefixes = reward_parent_prefixes
 
     @classmethod
-    async def create(cls, db: ChainDB) -> RocksCoinStore:
-        return cls(db)
+    async def create(
+        cls, db: ChainDB, reward_parent_prefixes: tuple[bytes, bytes] | None = None
+    ) -> RocksCoinStore:
+        return cls(db, reward_parent_prefixes)
+
+    def _reward_parent_height(self, parent_id: bytes32) -> int | None:
+        prefixes = self._reward_parent_prefixes
+        if prefixes is None:
+            return None
+        raw = bytes(parent_id)
+        if raw[:16] not in prefixes:
+            return None
+        height = int.from_bytes(raw[16:], "big")
+        if height > 0xFFFFFFFF:
+            return None
+        return height
 
     async def import_new_rows(self, rows: list[tuple[object, ...]]) -> None:
         """Insert coins that are known to be absent. One sorted write, with the WAL off.
 
-        A crash during the coin snapshot recopies every coin, so this batch does not need
-        to survive a power loss by itself. `rows` are the SQLite coin_record columns:
+        A crash while the copy is still in the coin step recopies every coin, so this
+        batch does not need its own log. The copy flushes these families before it
+        records that the coin step is finished. `rows` are the SQLite coin_record columns:
         name, confirmed, spent, coinbase, puzzle hash, parent, amount, timestamp.
         """
         if len(rows) == 0:
@@ -488,18 +512,18 @@ class RocksCoinStore:
     ) -> list[CoinRecord]:
         if len(names) == 0:
             return []
-        found: list[CoinRecord] = []
         async with self.db.reader_no_transaction() as view:
-            for name in names:
-                raw = await view.get(CF_COINS, bytes(name))
-                if raw is None:
-                    continue
-                stored = decode_coin(name, raw)
-                if stored.confirmed_index < int(start_height) or stored.confirmed_index >= int(end_height):
-                    continue
-                if not include_spent_coins and stored.spent_index > 0:
-                    continue
-                found.append(_to_record(stored))
+            loaded = await self._load_many(view, names)
+        found: list[CoinRecord] = []
+        for name in names:
+            stored = loaded.get(name)
+            if stored is None:
+                continue
+            if stored.confirmed_index < int(start_height) or stored.confirmed_index >= int(end_height):
+                continue
+            if not include_spent_coins and stored.spent_index > 0:
+                continue
+            found.append(_to_record(stored))
         return found
 
     async def get_coin_records(self, names: Collection[bytes32]) -> list[CoinRecord]:
@@ -513,41 +537,61 @@ class RocksCoinStore:
         return [_to_record(loaded[name]) for name in ordered if name in loaded]
 
     async def get_coins_added_at_height(self, height: uint32) -> list[CoinRecord]:
-        async with self.db.reader_no_transaction() as view:
-            stored = await self._stored_coins_added_at_height(view, int(height))
-        return [_to_record(record) for record in stored]
-
-    async def _stored_coins_added_at_height(self, view: _View, height: int) -> list[StoredCoin]:
-        raw = await view.get(CF_COIN_DELTA, u32_be(height))
-        if raw is not None:
-            added, _removed = decode_delta(raw)
-            loaded = await self._load_many(view, [created.coin_name for created in added])
-            return [loaded[created.coin_name] for created in added if created.coin_name in loaded]
-        prefix = u32_be(height)
-        rows = await view.scan(CF_COINS_BY_CONFIRMED, prefix, prefix_end(prefix))
-        names = [bytes32(key[-32:]) for key, _value in rows]
-        loaded = await self._load_many(view, names)
-        return [loaded[name] for name in names if name in loaded]
+        added, _removed = await self._stable_height_coins(int(height))
+        return [_to_record(record) for record in added]
 
     async def get_coins_removed_at_height(self, height: uint32) -> list[CoinRecord]:
         if height == 0:
             return []
-        async with self.db.reader_no_transaction() as view:
-            raw = await view.get(CF_COIN_DELTA, u32_be(int(height)))
-            if raw is not None:
-                _added, removed = decode_delta(raw)
-                loaded = await self._load_many(view, [name for name, _previous in removed])
-                return [_to_record(loaded[name]) for name, _previous in removed if name in loaded]
-        return await self._records_by_height_index(CF_COINS_BY_SPENT, int(height))
+        _added, removed = await self._stable_height_coins(int(height))
+        return [_to_record(record) for record in removed]
 
-    async def _records_by_height_index(self, cf: str, height: int) -> list[CoinRecord]:
-        prefix = u32_be(height)
-        end = prefix_end(prefix)
+    async def get_additions_and_removals_at_height(
+        self, height: uint32
+    ) -> tuple[list[CoinRecord], list[CoinRecord]]:
+        added, removed = await self._stable_height_coins(int(height))
+        if height == 0:
+            removed = []
+        return [_to_record(record) for record in added], [_to_record(record) for record in removed]
+
+    async def _stable_height_coins(self, height: int) -> tuple[list[StoredCoin], list[StoredCoin]]:
+        """Additions and removals at one height, from one journal value.
+
+        The journal and the coin rows are separate reads. A reorg can land between
+        them and make every old name miss, which is an empty list that was never
+        the chain. The read is repeated until both sides show the same journal.
+        """
+        key = u32_be(height)
         async with self.db.reader_no_transaction() as view:
-            rows = await view.scan(cf, prefix, end)
-            names = [bytes32(key[-32:]) for key, _value in rows]
-            loaded = await self._load_many(view, names)
-        return [_to_record(loaded[name]) for name in names if name in loaded]
+            for _attempt in range(_HEIGHT_READ_ATTEMPTS):
+                raw = await view.get(CF_COIN_DELTA, key)
+                if raw is not None:
+                    added_records, removed = decode_delta(raw)
+                    names = [record.coin_name for record in added_records]
+                    names.extend(name for name, _previous in removed)
+                    loaded = await self._load_many(view, names)
+                    if await view.get(CF_COIN_DELTA, key) != raw:
+                        continue
+                    return (
+                        [loaded[record.coin_name] for record in added_records if record.coin_name in loaded],
+                        [loaded[name] for name, _previous in removed if name in loaded],
+                    )
+                added_names = await self._height_index_names(view, CF_COINS_BY_CONFIRMED, height)
+                removed_names = [] if height == 0 else await self._height_index_names(view, CF_COINS_BY_SPENT, height)
+                loaded = await self._load_many(view, [*added_names, *removed_names])
+                added_again = await self._height_index_names(view, CF_COINS_BY_CONFIRMED, height)
+                removed_again = [] if height == 0 else await self._height_index_names(view, CF_COINS_BY_SPENT, height)
+                if added_names == added_again and removed_names == removed_again:
+                    return (
+                        [loaded[name] for name in added_names if name in loaded],
+                        [loaded[name] for name in removed_names if name in loaded],
+                    )
+        raise RuntimeError("coin records changed while a height was read")
+
+    async def _height_index_names(self, view: _View, cf: str, height: int) -> list[bytes32]:
+        prefix = u32_be(height)
+        rows = await view.scan(cf, prefix, prefix_end(prefix))
+        return [bytes32(key[-32:]) for key, _value in rows]
 
     async def rollback_to_block(self, block_index: int) -> dict[bytes32, CoinRecord]:
         changes: dict[bytes32, CoinRecord] = {}
@@ -725,12 +769,12 @@ class RocksCoinStore:
                     continue
                 seen.add(name)
                 ordered.append(name)
+        loaded = await self._load_many(view, ordered)
         found: list[StoredCoin] = []
         for name in ordered:
-            raw = await view.get(CF_COINS, bytes(name))
-            if raw is None:
+            stored = loaded.get(name)
+            if stored is None:
                 continue
-            stored = decode_coin(name, raw)
             if puzzle_hash is not None and stored.puzzle_hash != puzzle_hash:
                 continue
             if parent is not None and stored.parent != parent:
@@ -757,18 +801,20 @@ class RocksCoinStore:
         end_height: uint32 = uint32((2**32) - 1),
     ) -> list[CoinRecord]:
         found: dict[bytes32, CoinRecord] = {}
+        ranges = [
+            (bytes(puzzle_hash) + u32_be(int(start_height)), bytes(puzzle_hash) + u32_be(int(end_height)))
+            for puzzle_hash in puzzle_hashes
+        ]
         async with self.db.reader_no_transaction() as view:
             journals = await self._pending_journals(view)
-            for puzzle_hash in puzzle_hashes:
-                start = bytes(puzzle_hash) + u32_be(int(start_height))
-                end = bytes(puzzle_hash) + u32_be(int(end_height))
-                rows = await view.scan(CF_COINS_BY_PUZZLE_CONFIRMED, start, end)
-                for key, _value in rows:
-                    name = bytes32(key[-32:])
-                    raw = await view.get(CF_COINS, bytes(name))
-                    if raw is None:
+            grouped = await view.scan_prefixes(CF_COINS_BY_PUZZLE_CONFIRMED, ranges)
+            names = _unique_names(grouped)
+            loaded = await self._load_many(view, names)
+            for puzzle_hash, rows in zip(puzzle_hashes, grouped, strict=True):
+                for name in _coin_names(rows):
+                    stored = loaded.get(name)
+                    if stored is None:
                         continue
-                    stored = decode_coin(name, raw)
                     if not include_spent_coins and stored.spent_index > 0:
                         continue
                     found[name] = _to_record(stored)
@@ -798,16 +844,22 @@ class RocksCoinStore:
         seen: set[bytes32] = set()
         added_at: dict[int, list[StoredCoin]] = {}
         async with self.db.reader_no_transaction() as view:
+            parents = await view.get_many(CF_COINS, [bytes(parent_id) for parent_id in parent_ids])
             for parent_id in parent_ids:
-                raw = await view.get(CF_COINS, bytes(parent_id))
+                raw = parents.get(bytes(parent_id))
                 if raw is None:
+                    height = self._reward_parent_height(parent_id)
+                    if height is None:
+                        continue
+                else:
+                    parent = decode_coin(parent_id, raw)
+                    if parent.spent_index <= 0:
+                        continue
+                    height = parent.spent_index
+                if height < int(start_height) or height >= int(end_height):
                     continue
-                parent = decode_coin(parent_id, raw)
-                if parent.spent_index <= 0:
-                    continue
-                height = parent.spent_index
                 if height not in added_at:
-                    added_at[height] = await self._stored_coins_added_at_height(view, height)
+                    added_at[height] = (await self._stable_height_coins(height))[0]
                 matches = [stored for stored in added_at[height] if stored.parent == parent_id]
                 matches.sort(key=lambda stored: (stored.confirmed_index, bytes(stored.coin_name)))
                 for stored in matches:
@@ -823,6 +875,64 @@ class RocksCoinStore:
                         return found
         return found
 
+    async def _append_capped_states(
+        self,
+        view: _View,
+        names: list[bytes32],
+        states: set[CoinState],
+        min_height: int,
+        include_spent_coins: bool,
+        max_items: int,
+    ) -> None:
+        """Load coin records in cap-sized windows and stop once the cap is full."""
+        cursor = 0
+        while cursor < len(names) and len(states) < max_items:
+            room = max_items - len(states)
+            window = names[cursor : cursor + room]
+            cursor += len(window)
+            loaded = await self._load_many(view, window)
+            for name in window:
+                stored = loaded.get(name)
+                if stored is None:
+                    continue
+                if not self._state_visible(stored, min_height, include_spent_coins):
+                    continue
+                states.add(_to_state(stored))
+                if len(states) >= max_items:
+                    return
+
+    async def _scan_capped_index(
+        self,
+        view: _View,
+        family: str,
+        puzzle_hash: bytes32,
+        min_height: int,
+        include_spent_coins: bool,
+        states: set[CoinState],
+        seen: set[bytes32],
+        max_items: int,
+    ) -> None:
+        """Walk one puzzle index until the cap is full or the prefix ends."""
+        start = bytes(puzzle_hash) + u32_be(min_height)
+        end = prefix_end(bytes(puzzle_hash))
+        while len(states) < max_items and (end is None or start < end):
+            room = max_items - len(states)
+            limit = room if room < INDEX_SCAN_CHUNK else INDEX_SCAN_CHUNK
+            rows = await view.scan(family, start, end, limit=limit)
+            if not rows:
+                return
+            names: list[bytes32] = []
+            for key, _value in rows:
+                name = bytes32(key[-32:])
+                if name in seen:
+                    continue
+                seen.add(name)
+                names.append(name)
+            await self._append_capped_states(view, names, states, min_height, include_spent_coins, max_items)
+            if len(states) >= max_items or len(rows) < limit:
+                return
+            start = key_after(rows[-1][0])
+
     async def get_coin_states_by_puzzle_hashes(
         self,
         include_spent_coins: bool,
@@ -837,56 +947,46 @@ class RocksCoinStore:
         async with self.db.reader_no_transaction() as view:
             journals = await self._pending_journals(view)
             for puzzle_hash in puzzle_hashes:
-                await self._collect_puzzle_states(
-                    view, puzzle_hash, int(min_height), include_spent_coins, states, max_items, journals
+                seen: set[bytes32] = set()
+                await self._scan_capped_index(
+                    view,
+                    CF_COINS_BY_PUZZLE_CONFIRMED,
+                    puzzle_hash,
+                    int(min_height),
+                    include_spent_coins,
+                    states,
+                    seen,
+                    max_items,
                 )
                 if len(states) >= max_items:
-                    break
+                    return states
+                if include_spent_coins:
+                    await self._scan_capped_index(
+                        view,
+                        CF_COINS_BY_PUZZLE_SPENT,
+                        puzzle_hash,
+                        int(min_height),
+                        include_spent_coins,
+                        states,
+                        seen,
+                        max_items,
+                    )
+                    if len(states) >= max_items:
+                        return states
+                if not journals:
+                    continue
+                pending = await self._pending_coins(
+                    view, journals, puzzle_hash=puzzle_hash, include_removals=include_spent_coins
+                )
+                for stored in pending:
+                    if stored.coin_name in seen:
+                        continue
+                    if not self._state_visible(stored, int(min_height), include_spent_coins):
+                        continue
+                    states.add(_to_state(stored))
+                    if len(states) >= max_items:
+                        return states
         return states
-
-    async def _collect_puzzle_states(
-        self,
-        view: _View,
-        puzzle_hash: bytes32,
-        min_height: int,
-        include_spent_coins: bool,
-        states: set[CoinState],
-        max_items: int,
-        journals: list[tuple[list[StoredCoin], list[tuple[bytes32, int]]]] | None = None,
-    ) -> None:
-        start = bytes(puzzle_hash) + u32_be(min_height)
-        end = prefix_end(bytes(puzzle_hash))
-        rows = await view.scan(CF_COINS_BY_PUZZLE_CONFIRMED, start, end)
-        if include_spent_coins:
-            rows.extend(await view.scan(CF_COINS_BY_PUZZLE_SPENT, start, end))
-        seen: set[bytes32] = set()
-        for key, _value in rows:
-            name = bytes32(key[-32:])
-            if name in seen:
-                continue
-            seen.add(name)
-            raw = await view.get(CF_COINS, bytes(name))
-            if raw is None:
-                continue
-            stored = decode_coin(name, raw)
-            if not self._state_visible(stored, min_height, include_spent_coins):
-                continue
-            states.add(_to_state(stored))
-            if len(states) >= max_items:
-                return
-        if not journals:
-            return
-        pending = await self._pending_coins(
-            view, journals, puzzle_hash=puzzle_hash, include_removals=include_spent_coins
-        )
-        for stored in pending:
-            if stored.coin_name in seen:
-                continue
-            if not self._state_visible(stored, min_height, include_spent_coins):
-                continue
-            states.add(_to_state(stored))
-            if len(states) >= max_items:
-                return
 
     async def get_coin_states_by_ids(
         self,
@@ -899,42 +999,51 @@ class RocksCoinStore:
     ) -> list[CoinState]:
         if max_items <= 0 or len(coin_ids) == 0:
             return []
+        ordered_ids = list(coin_ids)
         states: list[CoinState] = []
         limit_height = max_height != uint32.MAXIMUM
+        cursor = 0
         async with self.db.reader_no_transaction() as view:
-            for coin_id in coin_ids:
-                raw = await view.get(CF_COINS, bytes(coin_id))
-                if raw is None:
-                    continue
-                stored = decode_coin(coin_id, raw)
-                if stored.confirmed_index < int(min_height) and stored.spent_index < int(min_height):
-                    continue
-                if limit_height and (stored.confirmed_index > int(max_height) or stored.spent_index > int(max_height)):
-                    continue
-                if not include_spent_coins and stored.spent_index > 0:
-                    continue
-                states.append(_to_state(stored))
-                if len(states) >= max_items:
-                    break
+            while cursor < len(ordered_ids) and len(states) < max_items:
+                room = max_items - len(states)
+                window = ordered_ids[cursor : cursor + room]
+                cursor += len(window)
+                loaded = await self._load_many(view, window)
+                for coin_id in window:
+                    stored = loaded.get(coin_id)
+                    if stored is None:
+                        continue
+                    if stored.confirmed_index < int(min_height) and stored.spent_index < int(min_height):
+                        continue
+                    if limit_height and (
+                        stored.confirmed_index > int(max_height) or stored.spent_index > int(max_height)
+                    ):
+                        continue
+                    if not include_spent_coins and stored.spent_index > 0:
+                        continue
+                    states.append(_to_state(stored))
+                    if len(states) >= max_items:
+                        return states
         return states
 
     async def get_unspent_lineage_info_for_puzzle_hash(self, puzzle_hash: bytes32) -> UnspentLineageInfo | None:
         end = prefix_end(bytes(puzzle_hash))
         async with self.db.reader_no_transaction() as view:
             rows = await view.scan(CF_FF_UNSPENT, bytes(puzzle_hash), end)
+            names = _coin_names(rows)
+            loaded = await self._load_many(view, names)
+            parent_ids = list(dict.fromkeys(loaded[name].parent for name in names if name in loaded))
+            parents = await self._load_many(view, parent_ids)
             matches: dict[bytes32, UnspentLineageInfo] = {}
-            for key, _value in rows:
-                name = bytes32(key[-32:])
-                raw = await view.get(CF_COINS, bytes(name))
-                if raw is None:
+            for name in names:
+                unspent = loaded.get(name)
+                if unspent is None:
                     continue
-                unspent = decode_coin(name, raw)
                 if unspent.spent_index != -1 or unspent.puzzle_hash != puzzle_hash:
                     continue
-                parent_raw = await view.get(CF_COINS, bytes(unspent.parent))
-                if parent_raw is None:
+                parent = parents.get(unspent.parent)
+                if parent is None:
                     continue
-                parent = decode_coin(unspent.parent, parent_raw)
                 if (
                     parent.spent_index > 0
                     and parent.puzzle_hash == unspent.puzzle_hash
@@ -947,13 +1056,15 @@ class RocksCoinStore:
                     )
             journals = await self._pending_journals(view)
             pending = await self._pending_coins(view, journals, puzzle_hash=puzzle_hash)
+            pending_parents = await self._load_many(
+                view, list(dict.fromkeys(unspent.parent for unspent in pending))
+            )
             for unspent in pending:
                 if unspent.spent_index != -1 or unspent.coin_name in matches:
                     continue
-                parent_raw = await view.get(CF_COINS, bytes(unspent.parent))
-                if parent_raw is None:
+                parent = pending_parents.get(unspent.parent)
+                if parent is None:
                     continue
-                parent = decode_coin(unspent.parent, parent_raw)
                 if (
                     parent.spent_index > 0
                     and parent.puzzle_hash == unspent.puzzle_hash
@@ -997,42 +1108,218 @@ class RocksCoinStore:
         by_name: dict[bytes32, CoinState] = {}
         async with self.db.reader_no_transaction() as view:
             journals = await self._pending_journals(view)
-            for puzzle_hash in puzzle_hashes:
-                await _collect_ordered(
+            closed_before = await _fill_batch_page(
+                self,
+                view,
+                puzzle_hashes,
+                by_name,
+                int(min_height),
+                include_spent,
+                include_unspent,
+                int(min_amount),
+                max_items,
+            )
+            if journals:
+                for puzzle_hash in puzzle_hashes:
+                    pending = await self._pending_coins(
+                        view, journals, puzzle_hash=puzzle_hash, include_removals=include_spent
+                    )
+                    _keep_batch_coins(
+                        pending,
+                        by_name,
+                        int(min_height),
+                        include_spent,
+                        include_unspent,
+                        int(min_amount),
+                        closed_before,
+                    )
+            if include_hinted:
+                await _fill_batch_hints(
+                    self,
                     view,
-                    puzzle_hash,
+                    puzzle_hashes,
+                    by_name,
                     int(min_height),
                     include_spent,
                     include_unspent,
                     int(min_amount),
-                    by_name,
+                    closed_before,
                 )
-                pending = await self._pending_coins(
-                    view, journals, puzzle_hash=puzzle_hash, include_removals=include_spent
-                )
-                for stored in pending:
-                    if stored.coin_name in by_name:
-                        continue
-                    if not _batch_accepts(stored, int(min_height), include_spent, include_unspent, int(min_amount)):
-                        continue
-                    by_name[stored.coin_name] = _to_state(stored)
-            if include_hinted:
-                for puzzle_hash in puzzle_hashes:
-                    hint_end = prefix_end(bytes(puzzle_hash))
-                    hint_rows = await view.scan(CF_HINTS_BY_HINT, bytes(puzzle_hash), hint_end)
-                    for key, _value in hint_rows:
-                        name = bytes32(key[-32:])
-                        if name in by_name:
-                            continue
-                        raw = await view.get(CF_COINS, bytes(name))
-                        if raw is None:
-                            continue
-                        stored = decode_coin(name, raw)
-                        if not _batch_accepts(stored, int(min_height), include_spent, include_unspent, int(min_amount)):
-                            continue
-                        by_name[name] = _to_state(stored)
         ordered = sorted(by_name.values(), key=_order_height)
         return _paginate(ordered, max_items)
+
+
+class _HeightCursor:
+    """Next unread confirmed-index keys for one puzzle hash."""
+
+    def __init__(self, puzzle_hash: bytes32) -> None:
+        self.start: bytes | None = bytes(puzzle_hash) + u32_be(0)
+        self.end = prefix_end(bytes(puzzle_hash))
+        self.rows: list[tuple[bytes, bytes]] = []
+        self.pos = 0
+        self.no_more = False
+
+    def has_row(self) -> bool:
+        return self.pos < len(self.rows)
+
+    def head(self) -> bytes:
+        return self.rows[self.pos][0]
+
+    async def fill(self, view: _View) -> None:
+        if self.has_row() or self.no_more or self.start is None:
+            return
+        if self.end is not None and self.start >= self.end:
+            self.no_more = True
+            return
+        rows = await view.scan(CF_COINS_BY_PUZZLE_CONFIRMED, self.start, self.end, limit=INDEX_SCAN_CHUNK)
+        if len(rows) < INDEX_SCAN_CHUNK:
+            self.no_more = True
+        if not rows:
+            return
+        self.rows = rows
+        self.pos = 0
+        self.start = key_after(rows[-1][0])
+
+
+def _confirmed_height(key: bytes) -> int:
+    return u32_from_be(key[32:36])
+
+
+def _next_cursor(cursors: list[_HeightCursor]) -> _HeightCursor | None:
+    chosen: _HeightCursor | None = None
+    chosen_key = b""
+    chosen_height = 0
+    for cursor in cursors:
+        if not cursor.has_row():
+            continue
+        key = cursor.head()
+        height = _confirmed_height(key)
+        if chosen is None or height < chosen_height or (height == chosen_height and key < chosen_key):
+            chosen = cursor
+            chosen_key = key
+            chosen_height = height
+    return chosen
+
+
+async def _refill(view: _View, cursors: list[_HeightCursor]) -> None:
+    for cursor in cursors:
+        if not cursor.has_row():
+            await cursor.fill(view)
+
+
+def _page_closed(states: dict[bytes32, CoinState], before_height: int, max_items: int) -> bool:
+    """True when every unseen coin sorts at or after the page SQLite would return."""
+    low = 0
+    for state in states.values():
+        if _order_height(state) < before_height:
+            low += 1
+            if low >= max_items + 1:
+                return True
+    return False
+
+
+def _keep_batch_coins(
+    records: list[StoredCoin],
+    by_name: dict[bytes32, CoinState],
+    min_height: int,
+    include_spent: bool,
+    include_unspent: bool,
+    min_amount: int,
+    closed_before: int | None,
+) -> None:
+    for stored in records:
+        if stored.coin_name in by_name:
+            continue
+        if not _batch_accepts(stored, min_height, include_spent, include_unspent, min_amount):
+            continue
+        state = _to_state(stored)
+        if closed_before is not None and _order_height(state) >= closed_before:
+            continue
+        by_name[stored.coin_name] = state
+
+
+async def _fill_batch_page(
+    store: RocksCoinStore,
+    view: _View,
+    puzzle_hashes: list[bytes32],
+    by_name: dict[bytes32, CoinState],
+    min_height: int,
+    include_spent: bool,
+    include_unspent: bool,
+    min_amount: int,
+    max_items: int,
+) -> int | None:
+    """Load confirmed coins in height order and stop once a later height cannot change the page."""
+    cursors = [_HeightCursor(puzzle_hash) for puzzle_hash in puzzle_hashes]
+    await _refill(view, cursors)
+    while True:
+        await _refill(view, cursors)
+        first = _next_cursor(cursors)
+        if first is None:
+            return None
+        height = _confirmed_height(first.head())
+        names: list[bytes32] = []
+        while True:
+            await _refill(view, cursors)
+            current = _next_cursor(cursors)
+            if current is None:
+                next_height: int | None = None
+                break
+            key = current.head()
+            key_height = _confirmed_height(key)
+            if key_height != height:
+                next_height = key_height
+                break
+            current.pos += 1
+            names.append(bytes32(key[-32:]))
+        fresh = [name for name in dict.fromkeys(names) if name not in by_name]
+        loaded = await store._load_many(view, fresh)
+        _keep_batch_coins(
+            [loaded[name] for name in fresh if name in loaded],
+            by_name,
+            min_height,
+            include_spent,
+            include_unspent,
+            min_amount,
+            None,
+        )
+        if next_height is not None and _page_closed(by_name, next_height, max_items):
+            return next_height
+
+
+async def _fill_batch_hints(
+    store: RocksCoinStore,
+    view: _View,
+    puzzle_hashes: list[bytes32],
+    by_name: dict[bytes32, CoinState],
+    min_height: int,
+    include_spent: bool,
+    include_unspent: bool,
+    min_amount: int,
+    closed_before: int | None,
+) -> None:
+    """Hint keys are not height-ordered, so each hint is read in short pieces."""
+    for puzzle_hash in puzzle_hashes:
+        start = bytes(puzzle_hash)
+        end = prefix_end(start)
+        while end is None or start < end:
+            rows = await view.scan(CF_HINTS_BY_HINT, start, end, limit=INDEX_SCAN_CHUNK)
+            if not rows:
+                break
+            fresh = [name for name in dict.fromkeys(_coin_names(rows)) if name not in by_name]
+            loaded = await store._load_many(view, fresh)
+            _keep_batch_coins(
+                [loaded[name] for name in fresh if name in loaded],
+                by_name,
+                min_height,
+                include_spent,
+                include_unspent,
+                min_amount,
+                closed_before,
+            )
+            if len(rows) < INDEX_SCAN_CHUNK:
+                break
+            start = key_after(rows[-1][0])
 
 
 def _order_height(state: CoinState) -> int:
@@ -1056,27 +1343,20 @@ def _batch_accepts(
     return True
 
 
-async def _collect_ordered(
-    view: _View,
-    puzzle_hash: bytes32,
-    min_height: int,
-    include_spent: bool,
-    include_unspent: bool,
-    min_amount: int,
-    by_name: dict[bytes32, CoinState],
-) -> None:
-    end = prefix_end(bytes(puzzle_hash))
-    start = bytes(puzzle_hash) + u32_be(0)
-    rows = await view.scan(CF_COINS_BY_PUZZLE_CONFIRMED, start, end)
-    for key, _value in rows:
-        name = bytes32(key[-32:])
-        raw = await view.get(CF_COINS, bytes(name))
-        if raw is None:
-            continue
-        stored = decode_coin(name, raw)
-        if not _batch_accepts(stored, min_height, include_spent, include_unspent, min_amount):
-            continue
-        by_name[name] = _to_state(stored)
+def _coin_names(rows: list[tuple[bytes, bytes]]) -> list[bytes32]:
+    return [bytes32(key[-32:]) for key, _value in rows]
+
+
+def _unique_names(groups: list[list[tuple[bytes, bytes]]]) -> list[bytes32]:
+    names: list[bytes32] = []
+    seen: set[bytes32] = set()
+    for rows in groups:
+        for name in _coin_names(rows):
+            if name in seen:
+                continue
+            seen.add(name)
+            names.append(name)
+    return names
 
 
 def _paginate(ordered: list[CoinState], max_items: int) -> tuple[list[CoinState], uint32 | None]:

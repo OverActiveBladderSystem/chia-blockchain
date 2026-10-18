@@ -46,19 +46,38 @@ def _deliver_call_result(future: asyncio.Future[object], outcome: tuple[object] 
     future.set_result(result)
 
 
+def _reader_limit(bulk: bool, reader_count: int) -> int:
+    """How many multi-gets may run at once. A copy does not serve peers, so it uses none."""
+    if bulk:
+        return 0
+    # ``bool`` is an ``int``. A config value of true is not one reader.
+    if isinstance(reader_count, bool) or not isinstance(reader_count, int) or reader_count < 1:
+        raise ValueError("db_readers must be at least 1")
+    return reader_count
+
+
 class RocksBackend:
     """
-    rocksdict access serialized on one thread.
+    Writes, one-key reads, and range scans share one thread.
 
-    Reads and writes share that thread so a committed scan cannot observe a
-    partial batch. The event loop only waits on the result.
+    A range scan stays on that thread so it cannot observe a partial batch.
+    Multi-key reads use their own threads, up to ``reader_count`` at once.
+    Each multi-get is one committed generation, and a block save can commit
+    while it runs. ``bulk=True`` keeps the copy on the one writer thread.
+    ``db_readers`` is that cap. It does not include the writer, and 1 does
+    not put reads back on the writer queue.
     """
 
-    def __init__(self, path: Path, *, sync: str = "NORMAL", bulk: bool = False) -> None:
+    def __init__(self, path: Path, *, sync: str = "NORMAL", bulk: bool = False, reader_count: int = 4) -> None:
         self._path = path
         self._sync = sync
         self._bulk = bulk
+        self._reader_count = _reader_limit(bulk, reader_count)
         self._calls: queue.Queue[tuple[Callable[[], object], asyncio.Future[object]] | None] = queue.Queue()
+        self._read_calls: queue.Queue[tuple[Callable[[], object], asyncio.Future[object]] | None] = queue.Queue()
+        self._read_lock = threading.Lock()
+        self._closing = False
+        self._reader_threads: list[threading.Thread] = []
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread = threading.Thread(target=self._run, name="rocksdb", daemon=True)
         self._ready = threading.Event()
@@ -85,6 +104,10 @@ class RocksBackend:
         self._ready.wait()
         if self._open_error is not None:
             raise self._open_error
+        for index in range(self._reader_count):
+            thread = threading.Thread(target=self._run_reads, name=f"rocksdb-read-{index}", daemon=True)
+            thread.start()
+            self._reader_threads.append(thread)
 
     def _run(self) -> None:
         try:
@@ -121,11 +144,35 @@ class RocksBackend:
             # Checked on the loop thread: the future may already be cancelled.
             loop.call_soon_threadsafe(_deliver_call_result, future, outcome)
 
+    def _run_reads(self) -> None:
+        while True:
+            item = self._read_calls.get()
+            if item is None:
+                return
+            fn, future = item
+            loop = self._loop
+            assert loop is not None
+            try:
+                outcome: tuple[object] | BaseException = (fn(),)
+            except BaseException as exc:
+                outcome = exc
+            loop.call_soon_threadsafe(_deliver_call_result, future, outcome)
+
     async def _call(self, fn: Callable[[], _T]) -> _T:
         loop = asyncio.get_running_loop()
         self._loop = loop
         future: asyncio.Future[object] = loop.create_future()
         self._calls.put((fn, future))
+        return await future  # type: ignore[return-value]
+
+    async def _read_call(self, fn: Callable[[], _T]) -> _T:
+        loop = asyncio.get_running_loop()
+        self._loop = loop
+        future: asyncio.Future[object] = loop.create_future()
+        with self._read_lock:
+            if self._closing:
+                raise RuntimeError("database is closing")
+            self._read_calls.put((fn, future))
         return await future  # type: ignore[return-value]
 
     async def get(self, cf: str, key: bytes) -> bytes | None:
@@ -141,20 +188,26 @@ class RocksBackend:
 
         return await self._call(read)
 
-    async def get_many(self, cf: str, keys: list[bytes]) -> dict[bytes, bytes]:
-        def read() -> dict[bytes, bytes]:
-            family = self._families[cf]
-            found: dict[bytes, bytes] = {}
-            for key in keys:
-                try:
-                    value = family[key]
-                except KeyError:
-                    continue
-                if value is not None:
-                    found[key] = bytes(value)
-            return found
+    def _multiget(self, cf: str, keys: list[bytes]) -> dict[bytes, bytes]:
+        # One list read is one committed generation. A loop of one-key reads is not.
+        family = self._families[cf]
+        values = family.get(keys)  # type: ignore[attr-defined]
+        found: dict[bytes, bytes] = {}
+        for key, value in zip(keys, values, strict=True):
+            if value is not None:
+                found[key] = bytes(value)
+        return found
 
-        return await self._call(read)
+    async def get_many(self, cf: str, keys: list[bytes]) -> dict[bytes, bytes]:
+        if len(keys) == 0:
+            return {}
+
+        def read() -> dict[bytes, bytes]:
+            return self._multiget(cf, keys)
+
+        if self._reader_count == 0:
+            return await self._call(read)
+        return await self._read_call(read)
 
     async def scan(
         self, cf: str, start: bytes, end: bytes | None, *, limit: int | None = None
@@ -175,6 +228,29 @@ class RocksBackend:
                 rows.append((key, b"" if value is None else bytes(value)))
                 iterator.next()
             return rows
+
+        return await self._call(read)
+
+    async def scan_prefixes(
+        self, cf: str, ranges: list[tuple[bytes, bytes | None]]
+    ) -> list[list[tuple[bytes, bytes]]]:
+        # One scan() is one trip onto this thread. A bundle of coin ids stays one trip.
+        def read() -> list[list[tuple[bytes, bytes]]]:
+            family = self._families[cf]
+            iterator = family.iter()
+            grouped: list[list[tuple[bytes, bytes]]] = []
+            for start, end in ranges:
+                iterator.seek(start)
+                rows: list[tuple[bytes, bytes]] = []
+                while iterator.valid():
+                    key = bytes(iterator.key())
+                    if not key_in_range(key, start, end):
+                        break
+                    value = iterator.value()
+                    rows.append((key, b"" if value is None else bytes(value)))
+                    iterator.next()
+                grouped.append(rows)
+            return grouped
 
         return await self._call(read)
 
@@ -457,12 +533,22 @@ class RocksBackend:
 
     async def close(self) -> None:
         self._loop = asyncio.get_running_loop()
-        # The pack thread is the only other user of the column-family handles.
-        # Wait for it before those handles are dropped.
+        # The pack thread and the multi-get threads also use the column-family
+        # handles. Wait for them before those handles are dropped.
         self._chip_stop.set()
         chip = self._chip_thread
         if chip is not None and chip.is_alive() and chip is not threading.current_thread():
             await asyncio.to_thread(chip.join)
+
+        def _stop_readers() -> None:
+            with self._read_lock:
+                self._closing = True
+                for _reader in range(self._reader_count):
+                    self._read_calls.put(None)
+            for thread in self._reader_threads:
+                thread.join()
+
+        await asyncio.to_thread(_stop_readers)
 
         def _shutdown() -> None:
             self._calls.put(None)

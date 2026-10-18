@@ -92,3 +92,13 @@ def prefix_end(prefix: bytes) -> bytes | None:
     if not stripped:
         return None
     return stripped[:-1] + bytes([stripped[-1] + 1])
+
+
+def key_after(key: bytes) -> bytes:
+    """First bytewise key strictly after `key`."""
+    return key + b"\x00"
+
+
+# Wallet index walks return after this many keys so a block save can use the
+# database thread before the next piece of the same request.
+INDEX_SCAN_CHUNK = 4096
