@@ -576,7 +576,7 @@ class FullNode:
                     self._db_wrapper = None
             return
 
-        chain = ChainDB(RocksBackend(self.db_path, sync=db_sync))
+        chain = ChainDB(RocksBackend(self.db_path, sync=db_sync, reader_count=self.config.get("db_readers", 4)))
         self._chain_db = chain
         try:
             reason = await migration_block_reason(chain, self.db_path)
@@ -584,7 +584,8 @@ class FullNode:
                 raise RuntimeError(reason)
             self._block_store = await RocksBlockStore.create(chain)
             self._hint_store = await RocksHintStore.create(chain)
-            self._coin_store = await RocksCoinStore.create(chain)
+            genesis = bytes(self.constants.GENESIS_CHALLENGE)
+            self._coin_store = await RocksCoinStore.create(chain, (genesis[:16], genesis[16:]))
             # Finish lookup keys for any block that was saved and then interrupted
             # before its puzzle and parent indexes were written. Each chunk commits
             # on its own, so a large backlog logs its height instead of one silent write.

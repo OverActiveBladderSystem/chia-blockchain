@@ -1730,11 +1730,10 @@ class FullNodeAPI:
                 tx_addition_coins = []
                 removal_names = []
             else:
-                added_coins_records_coroutine = self.full_node.coin_store.get_coins_added_at_height(height)
-                removed_coins_records_coroutine = self.full_node.coin_store.get_coins_removed_at_height(height)
-                added_coins_records, removed_coins_records = await asyncio.gather(
-                    added_coins_records_coroutine, removed_coins_records_coroutine
-                )
+                (
+                    added_coins_records,
+                    removed_coins_records,
+                ) = await self.full_node.coin_store.get_additions_and_removals_at_height(height)
                 tx_addition_coins = [record.coin for record in added_coins_records if not record.coinbase]
                 removal_names = [record.coin.name() for record in removed_coins_records]
             header_blocks_bytes.append(
@@ -1779,11 +1778,10 @@ class FullNodeAPI:
             if not block.is_transaction_block():
                 header_blocks.append(get_block_header(block))
                 continue
-            added_coins_records_coroutine = self.full_node.coin_store.get_coins_added_at_height(block.height)
-            removed_coins_records_coroutine = self.full_node.coin_store.get_coins_removed_at_height(block.height)
-            added_coins_records, removed_coins_records = await asyncio.gather(
-                added_coins_records_coroutine, removed_coins_records_coroutine
-            )
+            (
+                added_coins_records,
+                removed_coins_records,
+            ) = await self.full_node.coin_store.get_additions_and_removals_at_height(block.height)
             added_coins = [record.coin for record in added_coins_records if not record.coinbase]
             removal_names = [record.coin.name() for record in removed_coins_records]
             header_block = get_block_header(block, (removal_names, added_coins))

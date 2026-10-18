@@ -258,6 +258,11 @@ class CoinStore:
                         coins.append(coin_record)
                 return coins
 
+    async def get_additions_and_removals_at_height(
+        self, height: uint32
+    ) -> tuple[list[CoinRecord], list[CoinRecord]]:
+        return await self.get_coins_added_at_height(height), await self.get_coins_removed_at_height(height)
+
     # Checks DB and DiffStores for CoinRecords with puzzle_hash and returns them
     async def get_coin_records_by_puzzle_hash(
         self,
