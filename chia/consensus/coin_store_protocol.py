@@ -53,6 +53,13 @@ class CoinStoreProtocol(Protocol):
         Returns the coins removed at a specific height
         """
 
+    async def get_additions_and_removals_at_height(
+        self, height: uint32
+    ) -> tuple[list[CoinRecord], list[CoinRecord]]:
+        """
+        Returns the coins added and removed at one height from the same read.
+        """
+
     async def rollback_to_block(self, block_index: int) -> dict[bytes32, CoinRecord]:
         """
         Rolls back the blockchain to the specified block index

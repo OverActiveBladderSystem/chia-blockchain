@@ -962,9 +962,8 @@ class Blockchain:
             if tx_filter is False:
                 header = get_block_header(block)
             elif block_has_transactions_generator(block):
-                added_coins_records, removed_coins_records = await asyncio.gather(
-                    self.coin_store.get_coins_added_at_height(block.height),
-                    self.coin_store.get_coins_removed_at_height(block.height),
+                added_coins_records, removed_coins_records = await self.coin_store.get_additions_and_removals_at_height(
+                    block.height
                 )
                 tx_additions = [cr.coin for cr in added_coins_records if not cr.coinbase]
                 removed = [cr.coin.name() for cr in removed_coins_records]
