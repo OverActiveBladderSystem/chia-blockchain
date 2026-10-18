@@ -149,6 +149,17 @@ def program_can_be_precomputed(block: FullBlock, generators: Mapping[int, bytes]
     return earlier_programs_for_block(block, generators) is not None
 
 
+# These failures describe the body bytes, which the header hash does not cover.
+# Saving them under the header hash makes the next honest copy of that block fail.
+_UNCACHEABLE_PROGRAM_ERRORS = frozenset(
+    {
+        Err.INVALID_TRANSACTIONS_GENERATOR_HASH,
+        Err.INVALID_TRANSACTIONS_INFO_HASH,
+        Err.INVALID_FOLIAGE_BLOCK_HASH,
+    }
+)
+
+
 def remember_precomputed_program(
     header_hash: bytes32,
     flags: int,
@@ -157,6 +168,8 @@ def remember_precomputed_program(
     err: Err | None,
     err_msg: str | None,
 ) -> None:
+    if err in _UNCACHEABLE_PROGRAM_ERRORS:
+        return
     with _program_cache_lock:
         _program_cache[header_hash] = (flags, refs_digest, conds, err, err_msg)
         _program_cache.move_to_end(header_hash)
@@ -177,7 +190,7 @@ def take_precomputed_program(
     digest = program_refs_digest(prev_generators)
     with _program_cache_lock:
         cached = _program_cache.pop(header_hash, None)
-    if cached is None or cached[0] != flags or cached[1] != digest:
+    if cached is None or cached[0] != flags or cached[1] != digest or cached[3] in _UNCACHEABLE_PROGRAM_ERRORS:
         return None
     return cached[3], cached[4], cached[2]
 
