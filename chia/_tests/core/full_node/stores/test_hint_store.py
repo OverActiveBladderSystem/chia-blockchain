@@ -252,6 +252,10 @@ async def test_counts(db_version: int, engine: str, tmp_path: Path) -> None:
 
         count = await hint_store.count_hints()
         assert count == 2
+        assert set(await hint_store.get_hints([coin_id_0, bytes32(32 * b"\x06"), coin_id_1])) == {
+            bytes32(hint_0),
+            bytes32(hint_1),
+        }
 
 
 @pytest.mark.anyio
