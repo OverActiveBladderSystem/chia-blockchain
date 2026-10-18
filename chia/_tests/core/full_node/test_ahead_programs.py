@@ -85,16 +85,37 @@ def test_saved_program_is_used_only_for_the_same_rules_and_older_programs() -> N
     header = bytes32(b"\x11" * 32)
     digest = program_refs_digest([b"older"])
     remember_precomputed_program(header, 7, digest, None, Err.INVALID_TRANSACTIONS_GENERATOR_HASH, None)
-    # Different rules drop the saved result.
+    # A hash-link error is not saved, so neither take finds it.
     assert take_precomputed_program(header, 8, [b"older"]) is None
     assert take_precomputed_program(header, 7, [b"older"]) is None
 
     remember_precomputed_program(header, 7, digest, None, Err.INVALID_TRANSACTIONS_GENERATOR_HASH, "bad")
-    # Different older programs drop the saved result.
+    # The same error is still not saved when the older programs differ.
     assert take_precomputed_program(header, 7, [b"other"]) is None
 
     remember_precomputed_program(header, 7, program_refs_digest([]), None, Err.BLOCK_COST_EXCEEDS_MAX, "cost")
     assert take_precomputed_program(header, 7, []) == (Err.BLOCK_COST_EXCEEDS_MAX, "cost", None)
+
+
+def test_hash_link_errors_are_not_reused_for_the_honest_block() -> None:
+    header = bytes32(b"\x12" * 32)
+    digest = program_refs_digest([b"older"])
+    for err in (
+        Err.INVALID_TRANSACTIONS_GENERATOR_HASH,
+        Err.INVALID_TRANSACTIONS_INFO_HASH,
+        Err.INVALID_FOLIAGE_BLOCK_HASH,
+    ):
+        remember_precomputed_program(header, 7, digest, None, err, "bad")
+        assert header not in validation._program_cache
+        assert take_precomputed_program(header, 7, [b"older"]) is None
+
+    # An entry stored by the old code is dropped instead of failing the honest block.
+    validation._program_cache[header] = (7, digest, None, Err.INVALID_TRANSACTIONS_GENERATOR_HASH, "bad")
+    assert take_precomputed_program(header, 7, [b"older"]) is None
+    assert header not in validation._program_cache
+
+    remember_precomputed_program(header, 7, digest, None, Err.BLOCK_COST_EXCEEDS_MAX, "cost")
+    assert take_precomputed_program(header, 7, [b"older"]) == (Err.BLOCK_COST_EXCEEDS_MAX, "cost", None)
 
 
 def test_generator_memory_keeps_blocks_just_downloaded() -> None:
