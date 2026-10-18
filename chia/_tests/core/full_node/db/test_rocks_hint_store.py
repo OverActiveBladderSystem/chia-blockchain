@@ -25,6 +25,10 @@ async def test_add_and_lookup_hints() -> None:
     assert await store.get_coin_ids(32 * b"\x03") == []
     assert await store.count_hints() == 3
     assert set(await store.get_hints([coin_0, coin_1])) == {bytes32(hint_0)}
+    assert await store.get_hints([coin_2, coin_0, bytes32(32 * b"\x07")]) == [
+        bytes32(hint_1),
+        bytes32(hint_0),
+    ]
 
 
 @pytest.mark.anyio

@@ -75,6 +75,11 @@ class _RecordingBackend:
     ) -> list[tuple[bytes, bytes]]:
         return await self.inner.scan(cf, start, end, limit=limit)
 
+    async def scan_prefixes(
+        self, cf: str, ranges: list[tuple[bytes, bytes | None]]
+    ) -> list[list[tuple[bytes, bytes]]]:
+        return await self.inner.scan_prefixes(cf, ranges)
+
     async def apply(self, ops: list[Op]) -> None:
         self.ops.extend(ops)
         await self.inner.apply(ops)

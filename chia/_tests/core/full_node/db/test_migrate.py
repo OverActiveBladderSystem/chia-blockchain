@@ -818,6 +818,289 @@ async def test_height_map_loads_from_a_migrated_database(tmp_path: Path) -> None
         await chain.close()
 
 
+def _create_v2_tables(db: sqlite3.Connection) -> None:
+    db.execute(
+        "CREATE TABLE full_blocks("
+        "header_hash blob PRIMARY KEY, prev_hash blob, height bigint, sub_epoch_summary blob,"
+        "is_fully_compactified tinyint, in_main_chain tinyint, block blob, block_record blob)"
+    )
+    db.execute("CREATE TABLE current_peak(key int PRIMARY KEY, hash blob)")
+    db.execute(
+        "CREATE TABLE coin_record("
+        "coin_name blob PRIMARY KEY, confirmed_index bigint, spent_index bigint, coinbase int,"
+        "puzzle_hash blob, coin_parent blob, amount blob, timestamp bigint)"
+    )
+    db.execute("CREATE TABLE hints(coin_id blob, hint blob, UNIQUE (coin_id, hint))")
+    db.execute("CREATE TABLE sub_epoch_segments_v3(ses_block_hash blob PRIMARY KEY, challenge_segments blob)")
+    db.execute("CREATE TABLE database_version(version int)")
+
+
+@pytest.mark.anyio
+async def test_follow_marks_a_fast_forward_coin_from_its_parent(tmp_path: Path) -> None:
+    sqlite_path = tmp_path / "chain.sqlite"
+    genesis = bytes32(b"\x01" * 32)
+    puzzle = bytes32(b"\x21" * 32)
+    parent = Coin(bytes32(b"\x22" * 32), puzzle, uint64(100))
+    child = Coin(parent.name(), puzzle, uint64(100))
+    other = Coin(bytes32(b"\x23" * 32), bytes32(b"\x24" * 32), uint64(7))
+    amount = (100).to_bytes(8, "big")
+    with sqlite3.connect(sqlite_path) as db:
+        _create_v2_tables(db)
+        db.execute("INSERT INTO database_version VALUES (2)")
+        db.execute(
+            "INSERT INTO full_blocks VALUES (?,?,?,?,?,?,?,?)",
+            (genesis, bytes(32), 0, None, 0, 1, b"block-0", b"record-0"),
+        )
+        db.execute("INSERT INTO current_peak VALUES (0, ?)", (genesis,))
+        db.execute(
+            "INSERT INTO coin_record VALUES (?,?,?,?,?,?,?,?)",
+            (parent.name(), 0, 0, 0, puzzle, parent.parent_coin_info, amount, 1),
+        )
+        db.commit()
+
+    block1 = bytes32(b"\x02" * 32)
+    block2 = bytes32(b"\x03" * 32)
+
+    async def extend_after_the_snapshot() -> None:
+        with sqlite3.connect(sqlite_path) as db:
+            db.executemany(
+                "INSERT INTO full_blocks VALUES (?,?,?,?,?,?,?,?)",
+                [
+                    (block1, genesis, 1, None, 0, 1, b"block-1", b"record-1"),
+                    (block2, block1, 2, None, 0, 1, b"block-2", b"record-2"),
+                ],
+            )
+            db.execute("UPDATE current_peak SET hash=? WHERE key=0", (block2,))
+            db.execute("UPDATE coin_record SET spent_index=1 WHERE coin_name=?", (parent.name(),))
+            db.execute(
+                "INSERT INTO coin_record VALUES (?,?,?,?,?,?,?,?)",
+                (child.name(), 1, 2, 0, puzzle, parent.name(), amount, 2),
+            )
+            db.execute(
+                "INSERT INTO coin_record VALUES (?,?,?,?,?,?,?,?)",
+                (
+                    other.name(),
+                    2,
+                    0,
+                    0,
+                    other.puzzle_hash,
+                    other.parent_coin_info,
+                    (7).to_bytes(8, "big"),
+                    3,
+                ),
+            )
+            db.commit()
+
+    rocks_path = await migrate_database(
+        sqlite_path,
+        tmp_path / "out",
+        selected_network="mainnet",
+        constants=DEFAULT_CONSTANTS,
+        assume_source_headroom=True,
+        before_follow=extend_after_the_snapshot,
+    )
+    chain = ChainDB(RocksBackend(rocks_path, sync="OFF"))
+    try:
+        coins = await RocksCoinStore.create(chain)
+        async with chain.writer():
+            await coins.rollback_to_block(1)
+        async with chain.reader_no_transaction() as view:
+            raw = await view.get("coins", bytes(child.name()))
+        assert raw is not None
+        assert int.from_bytes(raw[4:12], "little", signed=True) == -1
+        lineage = await coins.get_unspent_lineage_info_for_puzzle_hash(puzzle)
+        assert lineage is not None
+        assert lineage.coin_id == child.name()
+        assert lineage.parent_id == parent.name()
+    finally:
+        await chain.close()
+
+
+@pytest.mark.anyio
+async def test_follow_resumes_when_coins_were_saved_without_the_peak(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sqlite_path = tmp_path / "chain.sqlite"
+    peak, _unspent = _write_sqlite(sqlite_path)
+    output = tmp_path / "out"
+    new_peak = bytes32(b"\x03" * 32)
+
+    async def add_block_before_follow() -> None:
+        with sqlite3.connect(sqlite_path) as db:
+            db.execute(
+                "INSERT INTO full_blocks VALUES (?,?,?,?,?,?,?,?)",
+                (new_peak, peak, 2, None, 0, 1, b"block-2", b"record-2"),
+            )
+            db.execute("UPDATE current_peak SET hash=? WHERE key=0", (new_peak,))
+            db.execute(
+                "INSERT INTO coin_record VALUES (?,?,?,?,?,?,?,?)",
+                (b"\x35" * 32, 2, 0, 0, b"\x11" * 32, b"\x22" * 32, (50).to_bytes(8, "big"), 12),
+            )
+            db.commit()
+
+    rocks_path = await migrate_database(
+        sqlite_path,
+        output,
+        selected_network="mainnet",
+        constants=DEFAULT_CONSTANTS,
+        assume_source_headroom=True,
+        before_follow=add_block_before_follow,
+    )
+    chain = ChainDB(RocksBackend(rocks_path, sync="OFF"))
+    try:
+        coins = await RocksCoinStore.create(chain)
+        unspent = await coins.num_unspent()
+        async with chain.writer() as session:
+            session.put("meta", b"peak", bytes(peak))
+            session.put("meta", b"migrate_phase", b"follow")
+            session.delete("meta", b"complete")
+    finally:
+        await chain.close()
+
+    async def refuse_new_block(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("the saved coins were applied again")
+
+    monkeypatch.setattr(RocksCoinStore, "new_block", refuse_new_block)
+    again = await migrate_database(
+        sqlite_path,
+        output,
+        selected_network="mainnet",
+        constants=DEFAULT_CONSTANTS,
+        assume_source_headroom=True,
+    )
+    assert again == rocks_path
+    chain = ChainDB(RocksBackend(rocks_path, sync="OFF"))
+    try:
+        from chia.full_node.db.block_store import RocksBlockStore
+
+        blocks = await RocksBlockStore.create(chain, use_cache=False)
+        coins = await RocksCoinStore.create(chain)
+        assert await blocks.get_peak() == (new_peak, 2)
+        assert await coins.num_unspent() == unspent
+    finally:
+        await chain.close()
+    assert await unfinished_migration_reason(rocks_path) is None
+
+
+@pytest.mark.anyio
+async def test_follow_replaces_a_saved_block_when_sqlite_reorgs_before_the_peak(tmp_path: Path) -> None:
+    sqlite_path = tmp_path / "chain.sqlite"
+    peak, _unspent = _write_sqlite(sqlite_path)
+    output = tmp_path / "out"
+    saved = bytes32(b"\x03" * 32)
+    replacement = bytes32(b"\x04" * 32)
+    saved_coin = bytes32(b"\x35" * 32)
+    replacement_coin = bytes32(b"\x36" * 32)
+
+    async def add_block_before_follow() -> None:
+        with sqlite3.connect(sqlite_path) as db:
+            db.execute(
+                "INSERT INTO full_blocks VALUES (?,?,?,?,?,?,?,?)",
+                (saved, peak, 2, None, 0, 1, b"block-2", b"record-2"),
+            )
+            db.execute("UPDATE current_peak SET hash=? WHERE key=0", (saved,))
+            db.execute(
+                "INSERT INTO coin_record VALUES (?,?,?,?,?,?,?,?)",
+                (saved_coin, 2, 0, 0, b"\x11" * 32, b"\x22" * 32, (50).to_bytes(8, "big"), 12),
+            )
+            db.commit()
+
+    rocks_path = await migrate_database(
+        sqlite_path,
+        output,
+        selected_network="mainnet",
+        constants=DEFAULT_CONSTANTS,
+        assume_source_headroom=True,
+        before_follow=add_block_before_follow,
+    )
+    chain = ChainDB(RocksBackend(rocks_path, sync="OFF"))
+    try:
+        async with chain.writer() as session:
+            session.put("meta", b"peak", bytes(peak))
+            session.put("meta", b"migrate_phase", b"follow")
+            session.delete("meta", b"complete")
+    finally:
+        await chain.close()
+    with sqlite3.connect(sqlite_path) as db:
+        db.execute("UPDATE full_blocks SET in_main_chain=0 WHERE header_hash=?", (saved,))
+        db.execute(
+            "INSERT INTO full_blocks VALUES (?,?,?,?,?,?,?,?)",
+            (replacement, peak, 2, None, 0, 1, b"block-2b", b"record-2b"),
+        )
+        db.execute("UPDATE current_peak SET hash=? WHERE key=0", (replacement,))
+        db.execute("DELETE FROM coin_record WHERE coin_name=?", (saved_coin,))
+        db.execute(
+            "INSERT INTO coin_record VALUES (?,?,?,?,?,?,?,?)",
+            (replacement_coin, 2, 0, 0, b"\x12" * 32, b"\x22" * 32, (60).to_bytes(8, "big"), 13),
+        )
+        db.commit()
+
+    again = await migrate_database(
+        sqlite_path,
+        output,
+        selected_network="mainnet",
+        constants=DEFAULT_CONSTANTS,
+        assume_source_headroom=True,
+    )
+    assert again == rocks_path
+    chain = ChainDB(RocksBackend(rocks_path, sync="OFF"))
+    try:
+        from chia.full_node.db.block_store import RocksBlockStore
+
+        blocks = await RocksBlockStore.create(chain, use_cache=False)
+        coins = await RocksCoinStore.create(chain)
+        assert await blocks.get_peak() == (replacement, 2)
+        assert await blocks.main_chain_hash_at(2) == replacement
+        assert await coins.get_coin_record(saved_coin) is None
+        replaced = await coins.get_coin_record(replacement_coin)
+        assert replaced is not None
+        assert replaced.spent_block_index == 0
+    finally:
+        await chain.close()
+
+
+@pytest.mark.anyio
+async def test_follow_stops_when_the_next_block_disappears(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sqlite_path = tmp_path / "chain.sqlite"
+    peak, _unspent = _write_sqlite(sqlite_path)
+    output = tmp_path / "out"
+    missing = bytes32(b"\x09" * 32)
+    flushed: list[tuple[str, bytes | None]] = []
+    real_flush = migrate_module.ChainDB.flush
+
+    async def record_flush(self: ChainDB, cf: str) -> None:
+        async with self.reader_no_transaction() as view:
+            phase = await view.get("meta", b"migrate_phase")
+        flushed.append((cf, phase))
+        await real_flush(self, cf)
+
+    monkeypatch.setattr(migrate_module.ChainDB, "flush", record_flush)
+
+    async def hide_the_next_block() -> None:
+        with sqlite3.connect(sqlite_path) as db:
+            db.execute(
+                "INSERT INTO full_blocks VALUES (?,?,?,?,?,?,?,?)",
+                (missing, peak, 2, None, 0, 0, b"block-2", b"record-2"),
+            )
+            db.execute("UPDATE current_peak SET hash=? WHERE key=0", (missing,))
+            db.commit()
+
+    with pytest.raises(MigrationPaused, match="not marked finished"):
+        await migrate_database(
+            sqlite_path,
+            output,
+            selected_network="mainnet",
+            constants=DEFAULT_CONSTANTS,
+            assume_source_headroom=True,
+            before_follow=hide_the_next_block,
+        )
+    assert [cf for cf, phase in flushed if phase == b"coins"] == list(migrate_module._COIN_SNAPSHOT_FAMILIES)
+    rocks_path = migrate_module.rocks_directory_for(output, "mainnet")
+    assert await unfinished_migration_reason(rocks_path) is not None
+
+
 @pytest.mark.anyio
 async def test_migrate_matches_coins_written_by_the_real_coin_store(tmp_path: Path) -> None:
     sqlite_path = tmp_path / "chain.sqlite"
