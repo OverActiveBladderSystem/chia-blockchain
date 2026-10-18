@@ -53,7 +53,7 @@ def get_discriminant(challenge: bytes32, size_bites: int) -> int:
         return cached
     try:
         value = int(create_discriminant(challenge, size_bites), 16)
-    except Exception:
+    except BaseException:
         with _discriminant_lock:
             _discriminant_inflight.pop(key, None)
         pending.set()
