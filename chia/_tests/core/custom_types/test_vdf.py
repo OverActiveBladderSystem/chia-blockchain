@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import threading
+
 import pytest
 from chia_rs import VDFInfo, VDFProof
 from chia_rs.sized_bytes import bytes32
@@ -21,6 +23,60 @@ def test_discriminant_cache_keeps_the_nearest_blocks_proved_ahead(monkeypatch: p
             vdf.get_discriminant(bytes32(i.to_bytes(32, "big")), 1024)
         assert len(vdf._discriminant_ready) == 2000
         assert (bytes(bytes32.zeros), 1024) in vdf._discriminant_ready
+    finally:
+        vdf._discriminant_ready.clear()
+        vdf._discriminant_inflight.clear()
+
+
+def test_interrupt_during_discriminant_build_releases_the_waiter(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = 0
+    started = threading.Event()
+    waiter_blocked = threading.Event()
+
+    def create(challenge_bytes: bytes, _size: int) -> str:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            pending = vdf._discriminant_inflight[bytes(challenge_bytes), 1024]
+            real_wait = pending.wait
+
+            def wait(timeout: float | None = None) -> bool:
+                waiter_blocked.set()
+                return real_wait(timeout)
+
+            pending.wait = wait  # type: ignore[method-assign]
+            started.set()
+            assert waiter_blocked.wait(2)
+            raise KeyboardInterrupt
+        return "ab"
+
+    monkeypatch.setattr(vdf, "create_discriminant", create)
+    vdf._discriminant_ready.clear()
+    vdf._discriminant_inflight.clear()
+    challenge = bytes32(b"\x05" * 32)
+    caught: list[BaseException] = []
+
+    def owner() -> None:
+        try:
+            vdf.get_discriminant(challenge, 1024)
+        except KeyboardInterrupt as exc:
+            caught.append(exc)
+
+    def waiter() -> None:
+        assert started.wait(2)
+        vdf.get_discriminant(challenge, 1024)
+
+    owner_thread = threading.Thread(target=owner)
+    waiter_thread = threading.Thread(target=waiter)
+    try:
+        owner_thread.start()
+        waiter_thread.start()
+        owner_thread.join(2)
+        waiter_thread.join(2)
+        assert not owner_thread.is_alive()
+        assert not waiter_thread.is_alive()
+        assert calls == 2
+        assert len(caught) == 1
     finally:
         vdf._discriminant_ready.clear()
         vdf._discriminant_inflight.clear()
